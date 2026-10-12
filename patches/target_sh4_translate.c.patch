@@ -1,5 +1,5 @@
 diff --git a/target/sh4/translate.c b/target/sh4/translate.c
-index 53b0921..766d57f 100644
+index 53b0921..ca4061e 100644
 --- a/target/sh4/translate.c
 +++ b/target/sh4/translate.c
 @@ -46,6 +46,19 @@ typedef struct DisasContext {
@@ -909,30 +909,92 @@ index 53b0921..766d57f 100644
  
  #ifdef CONFIG_USER_ONLY
      if (tbflags & TB_FLAG_GUSA_MASK) {
-@@ -2250,37 +2948,1042 @@ static void sh4_tr_insn_start(DisasContextBase *dcbase, CPUState *cs)
+@@ -2250,53 +2948,1175 @@ static void sh4_tr_insn_start(DisasContextBase *dcbase, CPUState *cs)
      tcg_gen_insn_start(ctx->base.pc_next, ctx->envflags);
  }
  
 -static void sh4_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
-+
+-{
+-    CPUSH4State *env = cpu_env(cs);
+-    DisasContext *ctx = container_of(dcbase, DisasContext, base);
+-
+-#ifdef CONFIG_USER_ONLY
+-    if (unlikely(ctx->envflags & TB_FLAG_GUSA_MASK)
+-        && !(ctx->envflags & TB_FLAG_GUSA_EXCLUSIVE)) {
+-        /*
+-         * We're in an gUSA region, and we have not already fallen
+-         * back on using an exclusive region.  Attempt to parse the
+-         * region into a single supported atomic operation.  Failure
+-         * is handled within the parser by raising an exception to
+-         * retry using an exclusive region.
+-         *
+-         * Parsing the region in one block conflicts with plugins,
+-         * so always use exclusive mode if plugins enabled.
+-         */
+-        if (ctx->base.plugin_enabled) {
+-            gen_restart_exclusive(ctx);
+-            ctx->base.pc_next += 2;
+-        } else {
+-            decode_gusa(ctx, env);
+-        }
+-        return;
+-    }
+-#endif
+ 
+-    ctx->opcode = translator_lduw(env, &ctx->base, ctx->base.pc_next);
+-    decode_opc(ctx);
+-    ctx->base.pc_next += 2;
+-}
 +/*
 + * SH-2A 32-bit instructions.
 + *
-+ * The CDJ-2000NXS2's GUI processor is an SH7269 (SH-2A). Its ISA is largely
-+ * the SH 16-bit set this translator already implements, plus a small group of
++ * The CDJ-2000NXS2's GUI processor is an SH7269 (SH-2A), and the CDJ-850's
++ * MAIN processor is a big-endian SH-2A as well. Their ISA is largely the SH
++ * 16-bit set this translator already implements, plus a small group of
 + * 32-bit instructions: few enough to add here rather than fork a target.
 + *
-+ * They occupy encodings SH-4 leaves undefined (0x0nm0, 0x0nm1, 0x3nm1), which
-+ * today raise an illegal instruction, so decoding them cannot change behaviour
-+ * for any SH-4 guest.
++ * They occupy encodings SH-4 leaves undefined (0x0nm0, 0x0nm1, 0x3nm1,
++ * 0x3n09 with bit 7 clear), which today raise an illegal instruction, so
++ * decoding them cannot change behaviour for any SH-4 guest.
++ *
++ * First-half masks and sizes per Linux
++ * arch/sh/kernel/cpu/sh2a/opcode_helper.c instruction_size(); second-word
++ * layouts per GNU binutils opcodes/sh-opc.h (arch_op32 entries).
 + *
 + * Returns true if a 32-bit instruction was decoded, in which case the caller
-+ * must advance the PC by 4 rather than 2.
++ * must advance the PC by 4 rather than 2. Returns false for anything else,
++ * including undefined second-word sub-opcodes, so the caller falls through
++ * to the 16-bit decoder and raises an illegal instruction as upstream does.
 + */
-+static bool decode_sh2a_32(DisasContext *ctx, CPUSH4State *env)
+ 
+-static void sh4_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
++/*
++ * The FPU-disabled raise for the 32-bit path. Same emission as the
++ * do_fpu_disabled label in _decode_opc (CHECK_FPU_ENABLED's goto cannot
++ * reach across functions): save state, raise through the helper, end the TB.
++ * Returns true when the exception was emitted (the insn is done).
++ */
++static bool gen_sh2a_32_fpu_disabled(DisasContext *ctx)
  {
--    CPUSH4State *env = cpu_env(cs);
 -    DisasContext *ctx = container_of(dcbase, DisasContext, base);
+-
+-    if (ctx->tbflags & TB_FLAG_GUSA_EXCLUSIVE) {
+-        /* Ending the region of exclusivity.  Clear the bits.  */
++    if (!(ctx->tbflags & (1u << SR_FD))) {
++        return false;
++    }
++    gen_save_cpu_state(ctx, true);
++    if (ctx->envflags & TB_FLAG_DELAY_SLOT_MASK) {
++        gen_helper_raise_slot_fpu_disable(tcg_env);
++    } else {
++        gen_helper_raise_fpu_disable(tcg_env);
++    }
++    ctx->base.is_jmp = DISAS_NORETURN;
++    return true;
++}
++
++static bool decode_sh2a_32(DisasContext *ctx, CPUSH4State *env)
++{
 +    uint16_t op = ctx->opcode;
 +    uint16_t w2;
 +    int n, m, disp, sub;
@@ -941,8 +1003,8 @@ index 53b0921..766d57f 100644
 +    switch (op & 0xf00f) {
 +    case 0x0000:   /* MOVI20  #imm20,Rn */
 +    case 0x0001:   /* MOVI20S #imm20,Rn */
-+    case 0x3001:   /* MOV.[BWL] with a 12-bit displacement */
-+    case 0x3009:   /* bit manipulation on memory */
++    case 0x3001:   /* MOV.[BWL]/MOVU/FMOV with a 12-bit displacement */
++    case 0x3009:   /* bit manipulation on memory (bit 7 rechecked below) */
 +        break;
 +    default:
 +        return false;
@@ -954,9 +1016,11 @@ index 53b0921..766d57f 100644
 +    /*
 +     * SH-2A bit manipulation: 0011nnnn0iii1001 + tttt dddddddddddd. imm3 picks
 +     * the bit, the second word's top nibble the operation, its low 12 bits a
-+     * displacement.
++     * displacement. Bit 7 of the first half is part of the opcode and must be
++     * 0 (Linux masks with 0xf08f here; binutils rejects IMM0_3Us with the bit
++     * set); anything else is neither a 32-bit form nor a 16-bit opcode.
 +     */
-+    if ((op & 0xf00f) == 0x3009) {
++    if ((op & 0xf08f) == 0x3009) {
 +        int bit = (op >> 4) & 0x7;
 +        int op2 = (w2 >> 12) & 0xf;
 +        int dd = w2 & 0x0fff;
@@ -965,28 +1029,13 @@ index 53b0921..766d57f 100644
 +
 +        tcg_gen_addi_i32(a, REG(n), dd);
 +        tcg_gen_qemu_ld_i32(v, a, ctx->memidx, MO_UB);
- 
--#ifdef CONFIG_USER_ONLY
--    if (unlikely(ctx->envflags & TB_FLAG_GUSA_MASK)
--        && !(ctx->envflags & TB_FLAG_GUSA_EXCLUSIVE)) {
-         /*
--         * We're in an gUSA region, and we have not already fallen
--         * back on using an exclusive region.  Attempt to parse the
--         * region into a single supported atomic operation.  Failure
--         * is handled within the parser by raising an exception to
--         * retry using an exclusive region.
--         *
--         * Parsing the region in one block conflicts with plugins,
--         * so always use exclusive mode if plugins enabled.
-+         * Second-word top nibble, from the manual's instruction table:
++
++        /*
++         * Second-word top nibble, per binutils opcodes/sh-opc.h:
 +         *   0 BCLR.B  1 BSET.B  2 BST.B  3 BLD.B
-+         *   4 BAND.B  5 BOR.B   6 BXOR.B  B BLDNOT.B  C BANDNOT.B
-          */
--        if (ctx->base.plugin_enabled) {
--            gen_restart_exclusive(ctx);
--            ctx->base.pc_next += 2;
--        } else {
--            decode_gusa(ctx, env);
++         *   4 BAND.B  5 BOR.B   6 BXOR.B
++         *   B BLDNOT.B  C BANDNOT.B  D BORNOT.B
++         */
 +        switch (op2) {
 +        case 0x0:                               /* bclr.b */
 +            tcg_gen_andi_i32(v, v, ~(1 << bit));
@@ -1004,10 +1053,7 @@ index 53b0921..766d57f 100644
 +            tcg_gen_or_i32(v, v, t);
 +            tcg_gen_qemu_st_i32(v, a, ctx->memidx, MO_UB);
 +            break;
-         }
--        return;
--    }
--#endif
++        }
 +        case 0x3:                               /* bld.b:  T = bit */
 +            tcg_gen_extract_i32(cpu_sr_t, v, bit, 1);
 +            break;
@@ -1018,10 +1064,7 @@ index 53b0921..766d57f 100644
 +        case 0x4:                               /* band.b:   T &= bit */
 +        case 0xc: {                             /* bandnot.b: T &= ~bit */
 +            TCGv b = tcg_temp_new();
- 
--    ctx->opcode = translator_lduw(env, &ctx->base, ctx->base.pc_next);
--    decode_opc(ctx);
--    ctx->base.pc_next += 2;
++
 +            tcg_gen_extract_i32(b, v, bit, 1);
 +            if (op2 == 0xc) {
 +                tcg_gen_xori_i32(b, b, 1);
@@ -1029,10 +1072,14 @@ index 53b0921..766d57f 100644
 +            tcg_gen_and_i32(cpu_sr_t, cpu_sr_t, b);
 +            break;
 +        }
-+        case 0x5: {                             /* bor.b:  T |= bit */
++        case 0x5:                               /* bor.b:  T |= bit */
++        case 0xd: {                             /* bornot.b: T |= ~bit */
 +            TCGv b = tcg_temp_new();
 +
 +            tcg_gen_extract_i32(b, v, bit, 1);
++            if (op2 == 0xd) {
++                tcg_gen_xori_i32(b, b, 1);
++            }
 +            tcg_gen_or_i32(cpu_sr_t, cpu_sr_t, b);
 +            break;
 +        }
@@ -1044,16 +1091,28 @@ index 53b0921..766d57f 100644
 +            break;
 +        }
 +        default:
-+            qemu_log_mask(LOG_UNIMP,
-+                          "sh2a: unimplemented 0x3nm9 sub-opcode 0x%x at "
-+                          "pc=0x%08x\n", op2, (uint32_t)ctx->base.pc_next);
-+            break;
++            /*
++             * No defined bit operation has this second word (binutils
++             * lists 0-6, 0xB-0xD only). Decline so the caller raises an
++             * illegal instruction; a silent nop here would leave a stale T
++             * that fails far away.
++             */
++            return false;
 +        }
 +        return true;
 +    }
 +
++    if ((op & 0xf00f) == 0x3009) {
++        /* Bit 7 set (see above): not a 32-bit form, and no 16-bit opcode
++         * matches either. */
++        return false;
++    }
++
 +    if ((op & 0xf00f) != 0x3001) {
-+        /* imm20 is (op[7:4] << 16) | w2, sign-extended from bit 19. */
++        /*
++         * imm20 is (op[7:4] << 16) | w2, sign-extended from bit 19
++         * (binutils IMM0_20); MOVI20S shifts the result up 8 (IMM0_20BY8).
++         */
 +        int32_t imm = (int32_t)((((uint32_t)op >> 4) & 0xf) << 16 | w2);
 +
 +        if (imm & 0x00080000) {
@@ -1112,18 +1171,63 @@ index 53b0921..766d57f 100644
 +        cdj_gen_rwatch_ea(ctx, addr);
 +        tcg_gen_qemu_ld_i32(REG(n), addr, ctx->memidx, MO_TEUW);
 +        return true;
++    case 0x3:   /* FMOV.S FRm,@(disp*4,Rn) / FMOV.D DRm,@(disp*8,Rn) */
++        if (gen_sh2a_32_fpu_disabled(ctx)) {
++            return true;
++        }
++        if (ctx->tbflags & FPSCR_SZ) {
++            /*
++             * Double: binutils gives FMOV.S and FMOV.D the same encoding
++             * here (DISP1_12BY4 vs DISP1_12BY8), so the size comes from
++             * FPSCR.SZ exactly as for every 16-bit fmov memory form above.
++             */
++            TCGv_i64 fp;
++
++            if (m & 1) {
++                /* Odd DR, as with float/ftrc's 0x0100 test. */
++                return false;
++            }
++            fp = tcg_temp_new_i64();
++            gen_load_fpr64(ctx, fp, m);
++            tcg_gen_addi_i32(addr, REG(n), disp * 8);
++            tcg_gen_qemu_st_i64(fp, addr, ctx->memidx, MO_TEUQ | MO_ALIGN);
++        } else {
++            tcg_gen_addi_i32(addr, REG(n), disp * 4);
++            tcg_gen_qemu_st_i32(FREG(m), addr, ctx->memidx,
++                                MO_TEUL | MO_ALIGN);
++        }
++        cdj_gen_mwatch_after_store(ctx);
++        return true;
++    case 0x7:   /* FMOV.S @(disp*4,Rm),FRn / FMOV.D @(disp*8,Rm),DRn */
++        if (gen_sh2a_32_fpu_disabled(ctx)) {
++            return true;
++        }
++        if (ctx->tbflags & FPSCR_SZ) {
++            TCGv_i64 fp;
++
++            if (n & 1) {
++                return false;
++            }
++            fp = tcg_temp_new_i64();
++            tcg_gen_addi_i32(addr, REG(m), disp * 8);
++            cdj_gen_rwatch_ea(ctx, addr);
++            tcg_gen_qemu_ld_i64(fp, addr, ctx->memidx, MO_TEUQ | MO_ALIGN);
++            gen_store_fpr64(ctx, fp, n);
++        } else {
++            tcg_gen_addi_i32(addr, REG(m), disp * 4);
++            cdj_gen_rwatch_ea(ctx, addr);
++            tcg_gen_qemu_ld_i32(FREG(n), addr, ctx->memidx,
++                                MO_TEUL | MO_ALIGN);
++        }
++        return true;
 +    default:
 +        /*
-+         * The BAND.B / BOR.B / BXOR.B / BLD.B bit-manipulation group shares
-+         * this slot and is not implemented. Logged, because a missing load
-+         * treated as a silent nop leaves a stale register that fails far
-+         * away. Still a nop: aborting the translation block would be worse.
++         * No defined MOV/FMOV form has this second word (binutils lists
++         * 0-9 only). Decline so the caller raises an illegal instruction;
++         * a silent nop here would leave a stale register that fails far
++         * away.
 +         */
-+        qemu_log_mask(LOG_UNIMP,
-+                      "sh2a: unimplemented 0x3nm1 sub-opcode 0x%x at "
-+                      "pc=0x%08x -- treated as nop\n",
-+                      sub, (uint32_t)ctx->base.pc_next);
-+        return true;
++        return false;
 +    }
 +}
 +
@@ -1974,10 +2078,17 @@ index 53b0921..766d57f 100644
 +    decode_opc(ctx);
 +    ctx->base.pc_next += 2;
 +    cdj_io_split_check(ctx, ctx->base.pc_next - 2);
- }
++}
++
++static void sh4_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
++{
++    DisasContext *ctx = container_of(dcbase, DisasContext, base);
++
++    if (ctx->tbflags & TB_FLAG_GUSA_EXCLUSIVE) {
++        /* Ending the region of exclusivity.  Clear the bits.  */
+         ctx->envflags &= ~TB_FLAG_GUSA_MASK;
+     }
  
- static void sh4_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
-@@ -2295,8 +3998,32 @@ static void sh4_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
      switch (ctx->base.is_jmp) {
      case DISAS_STOP:
          gen_save_cpu_state(ctx, true);
