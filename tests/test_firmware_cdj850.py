@@ -22,3 +22,9 @@ def test_prepare_c850():
     m = model.load("cdj850")
     out = firmware.prepare(str(C850), model=m, say=lambda s: None)
     assert pathlib.Path(out, "extract", "main_flat.bin").is_file()
+
+
+def test_c850_sh_coverage():
+    from c850_sh_scan import sh2a_only_counts
+    counts = sh2a_only_counts("/Users/julius/Documents/cdj850-emu/C850MAIN.UPD")
+    assert counts, "scanner found no candidate SH-2A-only opcodes at all (scanner broken?)"
