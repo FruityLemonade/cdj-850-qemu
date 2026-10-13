@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "cdj_common.h"
+#include "../dsp56371.h"
 #include "port.h"
 #include "trace.h"
 
@@ -63,6 +64,9 @@ static uint64_t cdj850_port_read(void *opaque, hwaddr off, unsigned size)
             v |= (uint64_t)CDJ850_PORT_READY_BIT << ((size - 1 - i) * 8);
         }
     }
+    /* DSP-driven input levels (HREQ/DSPDREQ+PE6/PE8 READY once the DSP
+     * is out of reset; loopback latch before that). */
+    v = cdj850_dsp_adjust_read(off, size, v);
     if (cdj850_trace()) {
         info_report("cdj850: port read +0x%x size %u = 0x%x at pc=0x%08x "
                     "%" PRIu64 " ms", (unsigned)off, size, (unsigned)v,
@@ -80,6 +84,8 @@ static void cdj850_port_write(void *opaque, hwaddr off, uint64_t val,
     for (i = 0; i < size; i++) {
         s->reg[(off + size - 1 - i) & (CDJ850_PORT_SIZE - 1)] = val >> (8 * i);
     }
+    /* Snoop for the DSP bootstrap tracker + upload record. */
+    cdj850_dsp_snoop_write(off, val, size, s->cpu->env.pc, cdj850_vms());
     if (cdj850_trace()) {
         info_report("cdj850: port write +0x%x size %u = 0x%x at pc=0x%08x "
                     "%" PRIu64 " ms", (unsigned)off, size, (unsigned)val,
