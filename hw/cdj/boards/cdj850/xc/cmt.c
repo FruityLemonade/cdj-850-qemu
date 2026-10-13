@@ -17,9 +17,11 @@
  *
  * Interrupt delivery carries one vector in env.sh2a_irq_vector (there is no
  * INTC model to arbitrate, so sources queue here and a pump presents them
- * one at a time). CMI0 is vector 188 at level 8, as on the SH7269 GUI board
- * (same SH-2A family; the SH7263 manual table is unchecked, so if the tick
- * fires but is never taken, suspect the vector/level first).
+ * one at a time). CMI0 is vector 142 (SH7263 Hardware Manual Table 6.4;
+ * IPR08 in that table is USB|LCDC|CMT0|CMT1, and the firmware arms CMT0
+ * there). The firmware's own vector table (VBR=0xFFF80000) confirms it:
+ * [VBR+142*4] holds its tick trampoline, while the previously used 188
+ * (an IIC3 slot) holds the default-ignore ISR, so the RTOS tick never ran.
  *
  * Delivery does not consult the INTC storage in board.c: that block exists
  * so the firmware's IPR read-modify-writes read back, nothing more.
@@ -29,7 +31,7 @@
 #define CDJ850_CMT_SIZE     0x10
 /* Pphi feeds the timers; 66 MHz bus / 2 is the working assumption. */
 #define CDJ850_CMT_PCLK     33333333
-#define CDJ850_CMI0_VECTOR  188
+#define CDJ850_CMI0_VECTOR  142
 #define CDJ850_CMI0_LEVEL   8
 
 /* The queue is per-board (one MAIN CPU); no vmstate versioning beyond v1. */

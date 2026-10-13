@@ -1,9 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "cdj_common.h"
+#include "xc/adc.h"
 #include "xc/cmt.h"
 #include "xc/mbox.h"
+#include "xc/panel_link.h"
 #include "xc/port.h"
+#include "xc/scif.h"
 #include "xc/ser.h"
+#include "xc/vfd.h"
 /*
  * Pioneer CDJ-850 MAIN board (Renesas SH7263, SH-2A) -- bring-up.
  *
@@ -433,12 +437,17 @@ static void cdj850_init(MachineState *machine)
 
     cdj850_ccr_init(sysmem, cpu);
     cdj850_intc_init(sysmem, cpu);
+    cdj850_adc_init(sysmem, cpu);
     cdj850_port_init(sysmem, cpu);
     cdj850_ser_init(sysmem, cpu);
+    cdj850_scif_init(sysmem, cpu);
     cdj850_mbox_init(sysmem, cpu);
     cdj850_cmt_init(sysmem, cpu);
     /* Audit the silent SH-4 CCN mapping (see the device comment). */
     cdj850_ccnaudit_init(sysmem, cpu);
+    /* Panel link + VFD text window (MAIN-side model; panel CPU not
+     * emulated). The window stays empty under -nographic. */
+    vfd_init();
 
     /* On-chip peripheral block (BSC/CPG, less CCR/INTC/CMT/ports modelled
      * above): every remaining access is logged rather than silently
