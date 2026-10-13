@@ -52,8 +52,9 @@ static const CdjBoardDesc cdj850_board = {
     .fw_entry = 0x00000100,
     /* Power-on reset SP vector (flash offset 4). */
     .init_sp = 0xFFF90000,
-    /* 0 keeps the CPU's reset value (MD/RB/BL set, IMASK=15), which matches
-     * the SH-2A power-on state (VBR=0, IMASK=F); the bootloader sets SR. */
+    /* 0 keeps the CPU's reset value (IMASK=15); cdj850_reset then clears
+     * the SH-4-only RB/BL bits, which do not exist on the SH-2A (VBR=0
+     * comes from the reset itself). The bootloader sets SR after that. */
     .init_sr = 0,
     .sr_seed_slot = 0,
     .sr_seed = 0,
@@ -78,6 +79,22 @@ static void cdj850_reset(void *opaque)
     env->gregs[15] = cdj_board->init_sp;
     /* SH-2A has no MMU and runs privileged from reset. */
     env->mmucr = 0;
+    /*
+     * The SH-2A status register has no MD/RB/BL bits (SH-2A Software
+     * Manual §2.2.2: only T/S/IMASK/M/Q/CS/BO exist; reset sets IMASK
+     * and clears BO/CS, reserved bits read 0), but the sh4 target's
+     * reset applies SH-4 semantics (MD|RB|BL|IMASK). A stale RB=1
+     * selects the alternate R0-R7 bank for every translated TB, so the
+     * pool-2 registration in the init-call chain (0x0C0C64B0 loads base
+     * 0xFFF86638 into r4, then an ldc of a from-zero SR clears RB)
+     * strands its r4/r5 in bank 1 and registers base 0 instead: every
+     * pool-2 alloc NULLs and RTOS init halts with E_SYS at 0x0C0B8DBE
+     * (see notes/cdj850-bringup.md, Task 6c). Clear the SH-4-only bits
+     * at reset. MD stays set (the translator forces privileged mode
+     * for SH-2A and keys memidx off it); IMASK stays set per the
+     * manual.
+     */
+    env->sr &= ~((1u << SR_RB) | (1u << SR_BL));
 }
 
 /* On-chip RAM: 256 KB at 0xFFF80000, up to where the peripherals begin at

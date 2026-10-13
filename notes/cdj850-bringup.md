@@ -238,6 +238,73 @@ mirrors 0x0CEE33D0/0x0CEE33D4/0x0CEE3160/0x0CEE34C1, validators
 0x0C075E40/0x0C076006/0x0C0CF4C4/0x0C0C688A/0x0C0C6894, data
 0x0C155AAC, DMA DAR_1/2 hooked to mbox+8 (+0xFFFFC008/+0xFFFFC808).
 
+## Task 6c: genuine pool-2 init — stale SR.RB strands the pool-2 base (2026-10-13)
+
+Wall (no bridge) reproduced exactly: pc=0x0C0B8DBE, r0=-5, sr IMASK=14,
+18 unimp writes / 0 reads. Full report:
+.superpowers/sdd/2026-10-12-cdj850-support/task-6c-report.md. Forensics
+(GDB RSP + `-d in_asm`, in_asm authoritative; scripts in /tmp t6c_*.py):
+
+- The failing call is RTOS object-create 0x0C0CDDCA (from 0x0C0B8D96,
+  id=1): its pool-A alloc (via 0x0C0D0230, free list at [0x0CE4A32C] =
+  0x0CEEFF30) succeeds, but the 0x28 B pool-2 alloc (via 0x0C0D0256)
+  NULLs (head var [0x0CE4A330] = 0) -> E_SYS (-5) -> `bf` to the
+  `bra self` halt. The earlier 0x44 B pool-2 alloc (via 0x0C0C72A2 from
+  0x0C0895AC) fails the same way; its caller tolerates -5 (stores -1).
+- Pool-2 can never fill through MAIN code: exhaustive BE32 scan of a
+  wall-time pmemsave (32 MB SDRAM) shows [0x0CE4A330] has exactly 3
+  refs (1 writer: the pool-register store at 0x0C0C6BBE; 2 alloc
+  readers) and the flag [0x0C18BF68] has exactly 2 refs (both reads).
+  GDB write-watch from reset proves both stay 0: BSS zero-fill, an
+  init-table clear (0x0C0B92BA), and the pool-register itself writing 0.
+- The pool-2 arena base is decoded image data, not peer data:
+  [[0x0C0C64E0]] = [0x0C14F700] = 0xFFF86638 (on-chip RAM), written by
+  the bootloader LZSS decoder before init runs (byte-wise watch hits),
+  with valid .data neighbors. So this is NOT a Task 7/8 peer-data
+  dependency (Exit B out): the base is present, but never arrives.
+- Root cause (GDB single-step 0x0C0C64B8->0x0C0C64CE): QEMU's sh4
+  target applies SH-4 register banking to `-cpu sh2a`, but the SH-2A
+  SR has no MD/RB/BL bits (SH-2A Software Manual §2.2.2; reset sets
+  only IMASK, reserved bits read 0) and its register banks work
+  differently (interrupt auto-save + RESBANK, no active-bank bit).
+  QEMU resets SR to MD|RB|BL|IMASK (0x700000F0, verified live at
+  0x0C0C64B0 entry: sr=0x700000F1), so the whole boot runs on bank 1
+  self-consistently until 0x0C0C64B0 loads the pool-2 base into r4 and
+  executes `ldc` of a from-zero SR (0xF0, RB=0): the tail-call then
+  reads stale bank-0 r4=0/r5=4 and registers pool-2 base 0. On silicon
+  there is no bank switch, so the sequence is harmless and pool-2
+  registers 0xFFF86638. The RPOKE ramp is retired (known-bad, Task 6b).
+- Fix (board.c `cdj850_reset`, same pattern as the SH7269 GUI board's
+  `env->sr = (1u << SR_MD)`): clear the SH-4-only RB/BL bits at reset,
+  keeping MD (translator privilege) + IMASK (manual). No translator
+  change, no SH-4 path touched.
+
+Boot evidence (no bridge, EB rebuild): pool-2 head [0x0CE4A330] =
+0xFFF866CC (live OCRAM free list); the old wall is gone; unimp goes
+18w+0r -> 30w+8r, all legitimate driver-init touches (DMAC DAR/CHCR,
+DMARS0/1, CPG STBCR2, CPG/PFC writes). The 9th bridged read
+(0xFFFC750C) is confirmed bridge-degenerate (table-bytes-as-code in
+6b) and does not recur. Boot proceeds through RTOS init, both mailbox
+channels (0x90102), INTC IPR programming, and a CMT restart at 1560 ms.
+
+Next park (NOT this task; brief files are board.c/xc only): first task
+entry faults on the unimplemented SH-2A word 0x0068 at 0x0C08EFCA
+(`extu.b/tst/mov.l` dispatch in 0x0C08EFC4, called from 0x0C08F294):
+EXPEVT=0x180 illegal-insn -> firmware default vectors -> flash halt
+`bra self` at 0x000002F0 (task stack, IMASK=0, RB=0). 0x0068 is absent
+from notes/cdj850-sh-insns.md; identifying/implementing it is
+translator-patch work (same class as commit 444dd14). USB enum not
+reached (no USB activity yet).
+
+Follow-ups: (a) `do_interrupt` still sets SR.RB on delivered
+interrupts (helper.c:293) — two CMT ticks delivered harmlessly so far
+(ISR spills/restores, rte returns to RB=0), but a translator-level
+SH-2A banking disable (reset + ldc mask + gbank, gated on
+SH_FEATURE_SH2A like the existing MD-force) would remove the hazard
+class; (b) in_asm prints `mov r15,r5` for bytes 0x65F3 at 0x0C0C64C0
+(standard decode: mov r3,r5) — display-only nit, non-load-bearing
+(r5=4 comes from stale bank-0 +4 either way).
+
 ## Task 6b: wild-RTS forensics — Exit B, NOT a wild RTS (2026-10-13)
 
 Reproduced identically (bridge+RPOKE, 20 s): 30w+9r, pc=0x000002F8
