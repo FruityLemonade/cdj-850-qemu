@@ -185,3 +185,55 @@ Capstone-BE (QEMU `x/i` mis-decodes SH-2A; Capstone 5.0.7 itself
 misses some SH-2A 32-bit forms -- trust `in_asm`, not Capstone,
 for what executed).
 
+## Task 6 increment 3: mailbox/host-port 0xFFFFC000 (2026-10-13)
+
+Gap: bridged boot with increment 2 parks spinning at 0x0C075EA2
+(`mov.l @(r0,r1),r2; bld #0,r2; bf self` = wait bit0 of 0xFFFFC004).
+Driver 0x0C075E40 (called from 0x0C075E36, pr=0x0C075E3A): write
+command to +0x000, clear +0x004, poll +0x004 bit0, read response from
++0x000; second identical channel pair at +0x800/+0x804 (driver
+0x0C076006, same sequence). Status word also carries bit24 (second
+driver 0x0C075EF6 polls it: `tst 0x01000000; bt wait'). Modeled
+(board.c `cdj850_mbox_*`, window 0xFFFFC000/0x810, priority-2 carve
+out of the on-chip-hi RAM): data words echo last write (RAM-identical),
+status words (+0x004/+0x804) OR 0x01000001 (always-ready; the driver
+has bit0-clear init paths at 0x0C075F34 that proceed under it too).
+Boot evidence (bringup2, 20 s, bridge+TRACE): all 14 mbox accesses
+clean -- +0x004/+0x804 read 0x01000001, commands 0x00000000 then
+0x00090102 written to both +0x000/+0x800; the
+0x0C0CF4C4(0x0C155AAC,0) validation returns 0 (no E-6002-style halt
+at 0x0C075ECA). Unimp 19w+1r -> 30w+9r (strict progress): new touches
+CPG STBCR2 0xFFFE0018 (R, size1), DMAC DAR_1/CHCR_1 0xFFFE1014/0x101C
+(W 0xFFFFC008, W 0/0x1810, R), DMARS0 0xFFFE1300 (RMW 0x2300), same
+trio for channel 2 (0xFFFE1024/0x102C/0xFFFE1304=0x0027), BSC(?) read
+0xFFFC750C (size1), then port polls. No DMAC stub: 0x1810 leaves DE=0
+(mode only, no transfer; SAR/DMATCR never programmed), so storage
+would only risk a busy-spin regression -- recorded for later. DMAC
+map (from image pools at 0x0C1C14E0+: SAR/DAR/DMATCR/CHCR at
+0xFFFE1000+0x10n, DMAOR 0xFFFE1200, DMARS0/1 0xFFFE1300/0x1304,
+STBCR2 0xFFFE0018/MSTP8) matches the SH DMAC family (app-note
+cross-check).
+
+Park (NOT the milestone): after the port polls the firmware `rts's
+into data at 0x0C0C78D8 (pr=0x0C000008, stale on ALL port entries;
+sp pristine 0xFFF90000), garbage-executes to an illegal insn, and
+lands in the flash halt field at 0x000002F8 (`bra self`, pid-visible
+for the rest of the run; CMT vector 188 pends, IMASK=14). This is not
+a peripheral gap: the bootloader jmp @[0x49C]=0x0DDEFB7C entry is
+legitimate (flash vector), control is register-clean through the
+mailbox validation (pr verified at 0x0C075E5C=E3A, 0x0C07607E,
+0x0C0CF4C4, orchestrator-ret 0x0C00575C), and zero-filling the RPOKE
+scratch (GDB `M0c400000,1000:00..', verified zeros) reproduces the
+identical halt. Prime suspect: pool-2 objects consumed unconstructed
+(RPOKE bypasses RTOS init) or DMA-absent buffer state. Next step:
+fresh-code forensics on the orchestrator(0x0C00575C-ret)->port-entry
+path (DMA driver text before pool 0x0C1C14E0; stale dumps unreliable
+there -- use live `xp'), watching for the first `lds pr'/indirect
+call off the uninitialized structs.
+
+For Task 7 (panel): ser packet above + PFC 0xFFFE0414 RMW + CPG
+0xFFFE0018/STBCR2 patterns. For Task 8 (DSP): mailbox channels
+0xFFFFC000/4 + 0xFFFFC800/4, command words 0x01000000/0x90102, SDRAM
+mirrors 0x0CEE33D0/0x0CEE33D4/0x0CEE3160/0x0CEE34C1, validators
+0x0C075E40/0x0C076006/0x0C0CF4C4/0x0C0C688A/0x0C0C6894, data
+0x0C155AAC, DMA DAR_1/2 hooked to mbox+8 (+0xFFFFC008/+0xFFFFC808).
