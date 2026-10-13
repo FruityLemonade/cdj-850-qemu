@@ -416,3 +416,77 @@ USB peers; our ser/mbox stubs raise no RX/IRQ). What unblocks it needs
 a Task 7/8 call: panel-serial RX bytes? DSP/mbox reply IRQ? servo
 "no disc"? SH7263 manual (INTC IPR +0x40E source at 1477 ms, USB
 vectors) required before any IRQ wiring — do not guess vectors.
+
+## Task 8a: DSP/servo signaler hunt — BLOCKED (stop rule; 2026-10-13)
+
+Wall reproduced exactly (no bridge, EB rebuild of 07df07e): outer
+0x0C0B8EAE spins, scan 0x0C0B8ED8 returns mask 0 over 17 slots
+(claim bytes 0x0CE49CBC = 00 02..0E 00 00, words 0x0CE49C74 =
+01010101..11111111, ptrs 0x0CE49F58: slots 0/1/16 null, 2-15 OCRAM
+TCBs). Full report:
+.superpowers/sdd/2026-10-12-cdj850-support/task-8-report.md.
+
+- Scan protocol decoded (authoritative `-d in_asm`; the 32-bit forms
+  0x32E1_8000 = MOVU.B @(0,r14),r2 = claim-byte load and 0x8728-class
+  BLD display as `.word`, semantics execute correctly): per idx,
+  r3 = ptr[idx+1], r2 = [r3+20] (signal ptr), r4 = [r2] (signal
+  value), claim[idx] must equal idx+1, and a mask bit sets only when
+  [[ptr+20]] DIFFERS from word[idx]. Release needs ANY single bit
+  (outer `tst r0,r0; bt.s re-scan`); post-release stores mask to
+  [0x0CE49CD0] and calls the dispatcher (0x0C108xxx), else re-scans.
+- `[[ptr+20]]` writer watch (CDJ_MWATCH, all 14 signal cells across 4
+  boots + mask cell): the SOLE writer is the RTOS creator at
+  0x0C0C7490/pr 0x0C0C7438 (init-fill 0x0X0X0X0X); NO in-guest task
+  or ISR ever signals. The 13 claimed objects are a task-init
+  barrier gated purely on peer events.
+- "mailbox" 0xFFFFC000/0xFFFFC800 identified as SH7263 SSI0/SSI1
+  audio (hardware manual Table 18.2: SSICR_0 0xFFFFC000,
+  SSISR_0 0xFFFFC004, SSITDR_0 0xFFFFC008, SSIRDR_0 0xFFFFC00C; ch1
+  at 0xFFFFC800): init writes 0/0x90102 complete under the stub,
+  SSI0 IRQ pri 7 via IPR14 (0x0C075EE0), SSI1/3 + ROM-DEC IRQs via
+  IPR15; NO post-init SSI status/data/IRQ wait exists (14 accesses
+  at 1474-1475 ms, then silence incl. SSITDR DMA DAR with DE=0).
+  NOT the signaler. (Model rename to ssi.c deferred; behavior is
+  SSI-plausible today.)
+- E-6002 anchor INVALID: the string (and "6002") is absent from
+  C850MAIN.UPD, main_flat.bin, and live 32 MB SDRAM (exhaustive
+  search); error display uses "SYSTEM ERROR : %s %d" numerics. The
+  DSP-fail path cannot be xref'd; DSP program bytes not located.
+- DSP upload driver: Port-E GPIO bit-bang (transfer 0x0C0FC9xx,
+  gates 0x0C0FCA7A/0x0C0FCBB0 waiting PE6+PE8, bring-up
+  0x0C0FD7CC-8D0 asserting PEDRL bits 6,8,7 at 1530 ms, PEIORL
+  phases 0xF1C0/0x1C0, reply sampling PE9/PE12/PE14 into bytes at a
+  RAM buffer). PE12 = DSPDREQ (service-manual schematic: IC103 pin
+  72 = DSPDREQ; DSPC56371AF180 HREQ pin 38; DSPRST-H/SRVRST-H
+  release, DRVMUTE-L = no disc). Driver state + byte buffer FROZEN
+  across a 20 s live sample while port accesses cycle: retry-stuck
+  on DSP reply acceptance, NOT slow.
+- Release experiments (local-only port harness, REMOVED before
+  commit; delivery verified in TRACE: PFPRL reads 0xA000, PBPRL
+  0x18, PFPRH 0x01, PEDRL 0x1680/0x5680 with strapped bits; release
+  detector = MWATCH on [0x0CE49CD0]): pe12/pe9/pe10/pb3/pb4/
+  pf13+pf15/pf16/pf25/all-combined — NO release in any run.
+  Static READY levels do not satisfy the DSP reply validation;
+  supplying reply bytes would be fabrication. Stop rule applies.
+- Servo: PBPRL-bit3 poll (servoTask sub 0x0C0FF7D4) self-exits via
+  a 46-spin timeout; pb3 strap (verified 0x18) gives no release;
+  NO-DISC strings + DRVMUTE-L honest no-disc state already hold.
+  NOT the signaler (no "no disc" answer needed).
+- Release machinery PROVEN genuine-needing: PPOKE of one signal
+  cell sets the mask, dispatcher runs, then error-halt at
+  0x0C0B8ED4 (degenerate task state, 6b-class); GDB full-13-cell
+  poke runs the dispatcher repeatedly then halts with IMASK=15
+  (tick starved). Flags alone are insufficient — the 13 tasks must
+  REALLY execute.
+- Peer-event inventory for follow-ups (all sustained spins, no
+  fabrication): PB4 (0x0C0062CE), PF13/PF15 = SD_D1/SD_CD
+  (0x0C0D69B2/C0), PF16/FRB = flash-ready (0x0C0057E4), PE10
+  (0x0C10DCEA, usb region), PF25/SSIWS2 (0x0C106074), panel
+  accept-path stores 0x0C7F663C/0x0C7F65BC NEVER written (MWATCH;
+  Task 7 loose end (a), Task 9 scope), DSP reply-byte validation.
+  IPR arming decoded: IPR13 = SCIF0/1, IPR14 = SSI0 (pri 7),
+  IPR15 = SSI1/3 + ROM-DEC; only the CMT tick is delivered.
+- Verdict: 8a BLOCKED per its stop rule (neither DSP nor servo
+  releases it with driver-justified semantics). 8b/8c/8d stop
+  honestly (no carve target, no SHA, no core, no audio hook).
+  No code changed this slice (harness removed; tree == 07df07e).
