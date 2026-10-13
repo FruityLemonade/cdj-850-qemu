@@ -21,19 +21,32 @@
  *    two gate inputs PE6 then PE8 that 0x0C0FCA7A/0x0C0FCBB0 poll with
  *    `and #64 / and #0x100` before each transfer.
  *
- *    Pin-behavior sources (public docs only, never committed):
- *    - DSP56371 User Manual Rev 2.1 §4.3/Table 4-2 + Appendix A: SHI-slave
- *      bootstrap (modes 5/7) runs the factory ROM program after RESET
- *      deasserts; the SHI operates in slave mode with the HREQ pin enabled
- *      for receive; the host clocks count+address+data words which the ROM
- *      stores to PRAM and then jumps to. HREQ semantics (UM §2.7/SHI):
- *      slave-mode HREQ is an active-low OUTPUT, asserted to indicate the
- *      SHI is ready for the next data-word transfer, deasserted at the
- *      first clock pulse of the new transfer.
- *    - DSP56371 datasheet Rev 4.1 §12 (SPI Fig 9-12, I2C §13/Fig 13):
- *      HREQ ready/ack timing around SCK/SCL edges.
- *    Applied here as: READY (PE6/PE8/DSPDREQ = 1) once the DSP is alive.
- *    No DSP payload bytes are produced anywhere in this file.
+  *    Pin-behavior sources (public docs only, never committed):
+  *    - DSP56371 User Manual Rev 2.1 §4.3/Table 4-2 + Appendix A: SHI-slave
+  *      bootstrap (modes 5/7) runs the factory ROM program after RESET
+  *      deasserts; the SHI operates in slave mode with the HREQ pin enabled
+  *      for receive; the host clocks count+address+data words which the ROM
+  *      stores to PRAM and then jumps to. In the UM's SHI context
+  *      HREQ is an active-low OUTPUT: the LOW pulse is the per-transfer
+  *      assertion (the UM deasserts it at the first clock pulse of the new
+  *      transfer, §2.7), not the idle level.
+  *    - DSP56371 datasheet Rev 4.1 §12 (SPI Fig 9-12, I2C §13/Fig 13):
+  *      HREQ ready/ack timing around SCK/SCL edges.
+  *    - Service manual f70e4d.pdf §10.14 panel 5 (IC103 pin 72 DSPDREQ,
+  *      1.0 V/div, 20 us/div): the trace idles HIGH with a brief LOW pulse
+  *      per transaction — i.e. the quiescent/ready level is HIGH (H), and
+  *      LOW is only the momentary per-transfer assertion. §10.15 confirms
+  *      the companion reset polarity (DSPRST H = AUDIO DSP reset released).
+  *    Applied here as: READY (PE6/PE8/DSPDREQ = 1) once the DSP is alive.
+  *    This matches BOTH the waveform idle level AND the observed driver
+  *    behavior: gates 0x0C0FCA7A/0x0C0FCBB0 poll `and #64` then `and #0x100`
+  *    (Task 8a §2e), i.e. they wait for PE6=1 then PE8=1 before each
+  *    transfer — a LOW-means-ready line would spin them forever. There is
+  *    no contradiction with the UM's "active-low": that names the transfer
+  *    pulse polarity in SHI-bootstrap mode, while this DSP runs its PROM
+  *    application behind MAIN's custom GPIO protocol (not SHI SPI), whose
+  *    sampled ready level is HIGH.
+  *    No DSP payload bytes are produced anywhere in this file.
  *
  * 2. RECORD (observation, not fabrication). Every MAIN-driven Port-E
  *    write (PEDRL data + PEIORL direction) is appended to
