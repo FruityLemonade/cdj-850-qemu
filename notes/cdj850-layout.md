@@ -25,3 +25,27 @@ Survey assertions (2026-10-12, re-verified here):
 `main` SHA-256 above was computed with
 `python3 -c "import hashlib; print(hashlib.sha256(open('main.bin','rb').read()).hexdigest())"`
 on the carved output in a temp dir (never under `extract/`).
+
+## DSP init image (Task 8c, RECORDED — not carved from flash)
+
+Source: MAIN's Port-E bit-bang upload driver, observed live through the
+`dsp56371.c` record buffer (`CDJ850_DSP_RECORD`), three independent boots
+(20 s / 100 s / 25 s) — every byte driven by MAIN, none invented.
+Decode: byte-send `0x0C0FCC68` emits 5 PEDRL words per call
+(`0x0C0FCC86/0xB2/0xC4/0xD6/0xF8` sites); byte =
+`((w[0]>>12)&0xF)<<4 | ((w[3]>>12)&0xF`.
+
+- Bytes: 519 (259 `(index,data)` control pairs + trailing `0x00` pad).
+  Head pairs `(139,160),(140,128),(144,13),(145,136),…` match the static
+  `0x0C0FDA2C` 36-pair sequencer indices (Task 8b §1e) with LIVE data
+  (authoritative over the static delay-slot parse where they differ);
+  body walks banks `0xF0–0xF8` then `0xD7` with a repeated offset
+  sequence — a DSP control-register/memory fill, NOT DSP56371 opcodes
+  (24-bit-word census: 173/173 distinct, no vectors/branches/NOP —
+  address-structured init data).
+- SHA-256: `7132eb444b686275a6b2e4e595e6fd7e7351bea14e43709ce5998adfc3972064`.
+- Local copy (untracked, reproducible via the record env):
+  `extract/cdj850/dsp_init_image.bin` (519 B).
+- Census decision: opcode census N/A (not code) → no
+  interpreter-vs-vendor core call from this image; the genuine reply
+  needs DSP-side execution semantics (Task 8c report).

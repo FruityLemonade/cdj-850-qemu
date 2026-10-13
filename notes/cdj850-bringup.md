@@ -531,3 +531,36 @@ report). Live GDB RSP + `info registers` + `CDJ850_TRACE` + standing
   a guess). 8c inherits: unblock packed-MAIN→SDRAM + AUDIO/SERVO
   owner first; census starts at the 36-pair table + other 25
   sequencers + candidate block (unpinned).
+
+## Task 8c: DSP bootstrap READY + recorded init image; reply BLOCKED (2026-10-13)
+
+Full report:
+.superpowers/sdd/2026-10-12-cdj850-support/task-8c-report.md.
+EB `~/qemu-build-eb/qemu-system-sh4eb`, BASE `97ae419`.
+Commits: `7f29562` (mbox.c→ssi.c behavior-identical rename),
+`dddf5f7` (dsp56371.c bootstrap READY + record). No subagents. No
+bridge. No fabricated bytes/replies/vectors. Firmware read-only;
+datasheets live in /tmp only (never committed).
+
+- Datasheet fetch: DSP56371 UM Rev 2.1 (404 pp, operating modes §4.3,
+  SHI-slave bootstrap modes 5/7, HREQ slave-ready semantics, App. A ROM
+  source) + datasheet Rev 4.1 (HREQ/SPI-I2C timing §12/13) + DSP56300FM
+  + SH7263 §29/30/34 (PEIORL 0xFFFE3A06, PEDRL, direction-aware reads).
+  f70e4d §10 nets: DSPRST→IC301/56371 RESET_B pin47, SRVRST→IC201
+  (Toshiba TC94A15FG — NOT a 56371), DSPDREQ←HREQ pin38 → MAIN PE12,
+  MAIN PE7-11 ↔ DSP ESAI PE7-11, E-6002 = audio-DSP write fail
+  (manual pp.26/34/39/43 — 8a's "absent from MAIN strings" stands, but
+  the code is real in the manual/diag path).
+- Bootstrap model (`dsp56371.c` at board level): DSPRST tracker
+  (PEDRL 0→0x40→0x140→0x1C0, fires ~5-9 s) then READY (PE6/PE8/PE12)
+  on Port-E reads; every MAIN PEDRL/PEIORL write recorded
+  (`CDJ850_DSP_RECORD`, 20 B packed pc/ms/off/size/val). Reply DATA
+  nibble stays loopback — no DSP payloads produced.
+- Record: 519 genuine bytes, SHA-256 pinned in notes/cdj850-layout.md
+  (identical across 3 boots), 259 (index,data) pairs + 0x00 pad, banks
+  F0-F8/D7 — a control init image, NOT opcodes (census N/A, no core).
+  Post-image (~9 s) the driver spins 42.8k× in the CD6C/CDDC sample
+  loop (strobe 0x10 + sampler, PEDRL ∈ {0x1080,0x1180,0x11C0});
+  collector zeros, sample byte 0x11, accept flag 0, mask 0 — the reply
+  needs genuine DSP execution. BLOCKED precisely there; static-hunt
+  roadmap (packed-MAIN→SDRAM decoder) recorded for follow-ups.
