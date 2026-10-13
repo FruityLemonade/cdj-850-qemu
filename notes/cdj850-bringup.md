@@ -665,3 +665,45 @@ Motorola docs); derived bytes only in /tmp + untracked `extract/`.
   never-completing reply handshake or is assembled purely from
   scattered immediates. Suite: full `tests/` 665 passed, 38
   skipped, 1 xfailed (2026-10-13).
+
+## Task 8g: validator-driven reply brute force — DONE-BLOCKED (honest stop; 2026-10-13)
+
+Knob: `CDJ850_DSP_REPLY=0xHL` (H,L in 0-7; commit `b3d166e`;
+`dsp56371.[ch]` + `xc/port.c` pc threading; default unset = OFF =
+loopback-identical; suite `test_sh2a_smoke+test_firmware_cdj850`
+13 passed). Drives PE15:13 at the sampler's two phase reads
+(`0x0C0FC920`/`0x0C0FC95C`); PE12 READY untouched; assembled sample
+byte `((H<<1|1)<<4)|(L<<1|1)`.
+
+- Validator map (Capstone SH-2A BE + hand pools, all quoted in the
+  8g report): entry needs `[0x0C7F6D4F]==1` (`0x0C0FC728`); merge
+  (`0x0C0FC7B8-7EA`, helpers `0x0C107D9C` assemble / `0x0C107D6A`
+  split) folds sample-hi into flags `0x0C7F6D5C..63`; needs
+  `[0x0C7F6D5E]==1` (`0x0C0FC7F4`), `[0x0C7F6D67]==1`
+  (`0x0C0FC832`) for the accept leg (collector `0x0C0FC8DC` 10
+  samples → `0x0C7F6D1C`, `0x0C104D64` low-nibble {0,1,5}+nonzero
+  checks, `1→[0x0CE4B8F5]`); tail needs `[0x0C7F6D02]!=0`,
+  `[0x0CE4B8A6]!=0`, `[0x0C7F6AE9]==0`; outer caller `0x0C1050EC`
+  re-gates on `[0x0C7F6CF6]==7` + `[0x0CE4B8EB]!=0` → `0x0C0FF5FC`.
+- Static sweep (8 boots, H==L, 40 s each): samples land exactly
+  `0x11…0xFF` as predicted; flags = sample-hi bits (exact);
+  `[0x0C7F6D5E]=1` for H in {2,3,6,7}. ACCEPT/MASK/USB all zero;
+  no error halt (all stop PCs known park/task PCs).
+- Depth (RSP Z0 + manual step-over — plain `c` re-hits, counts
+  would lie): accept chain TRUE-zero across 4 boots (validator,
+  collector, `0x0C0FD3C0`, `0x0C0FD360`, dispatch setters
+  `0x0C10545C/51C`, `0x0C10099C`, `[A6]=1` writer `0x0C104E30`,
+  outer `0x0C1050EC`, common-return `0x0C104EE2`, clearer/checker
+  except checker). Hot loop = reply-spin → `0x0C0FC704` gate
+  (always rts) + dispatch `0x0C100A98` (checker, `[CF6]<12` gate)
+  + `0x0C104F1A` (reject tail) + `0x0C0FC24C` via `0x0C0FC6F4`
+  trampoline (PR-proved `pr=0x0C0FCD84`, not the accept path —
+  correlation≠causation, self-caught).
+- Wall: `[4F]` setters (`0x0C107776` family, 11 dispatch slots)
+  never run; `[67]` has no hot writer (only the cold
+  validator-internal SPLIT to `0x0C7F6D64`); flags bits 4-7 are
+  structurally unreachable (sample contributes bits 0-3 only,
+  ASM preserves); lo-nibble is unconsumed by every hot reader ⇒
+  static-8 already exhausts the single-decisive-byte bound.
+  Stopping per honesty gate; hardware capture (reply
+  timing/sequence + DSPDREQ pulse behavior) replaces the knob.
