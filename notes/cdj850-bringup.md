@@ -564,3 +564,58 @@ datasheets live in /tmp only (never committed).
   collector zeros, sample byte 0x11, accept flag 0, mask 0 — the reply
   needs genuine DSP execution. BLOCKED precisely there; static-hunt
   roadmap (packed-MAIN→SDRAM decoder) recorded for follow-ups.
+
+## Task 8d: program-source hunt — MOD=5 host-boot; decoder map; outer caller; carve BLOCKED (2026-10-13)
+
+Full report:
+.superpowers/sdd/2026-10-12-cdj850-support/task-8d-report.md.
+EB `~/qemu-build-eb/qemu-system-sh4eb`, BASE `0e01416`. No subagents.
+No bridge. No fabricated bytes/replies/vectors. Firmware read-only;
+datasheets live in /tmp only (never committed:
+`/tmp/371UM.pdf` + `/tmp/DSP56371.pdf` + `/tmp/DSP56300FM.pdf` +
+`/tmp/sh7263_hw.pdf`, re-fetched public Motorola docs).
+
+- MODA–D strapping (f70e4d.pdf p.76, §10.4 MAIN ASSY 3/4, vector-level
+  schematic read + `371UM.pdf` Table 4-2): R312→MODA (pin 51) and
+  R314→MODC (pin 49) to the supply rail (M, y=256.8 H+V topology),
+  R313→MODB (pin 50) and R315→MODD (pin 48) to GND (thick y=240 rail
+  via CORE_GND_3/pin 53), all 10 k. Alternating 1-0-1-0 assignment is
+  deliberate (a single GND plane would serve all-GND; two rails prove
+  differential strapping) → MODD:MODC:MODB:MODA = 0:1:0:1 = Mode 5
+  (Bootstrap from SHI, slave SPI; cf. mode 2 = 0010 PROM jump).
+  Implication: the DSP host-boots from MAIN — a MAIN-resident program
+  upload MUST exist; PROM-resident (no MAIN copy) is OUT. Residual:
+  M-rail exact voltage (1.25 V vs 3.3 V) unconfirmed from PDF vectors
+  alone, but digital-HIGH intent is unambiguous. R316 4.7 k
+  PINIT_NMI→GND and R351 100 DSPRST→RESET_B noted in passing.
+- Decoder map (`scripts/firmware/c850_unpack.py`, GPL + test): packed
+  `main_flat` `0x20–0x19E70A` (BE32 `0x19E6E6` + LZSS ring
+  4096/init `0x20`/pos 4078, whole-flat unpack for the bootloader's
+  overrun) → SDRAM `0x0C000000–0x0C39231E` (3744542 B, SHA-256 pinned
+  in notes/cdj850-layout.md); remainder `0x19E70A–0x1A0000` checksum +
+  pad. Verified against live 32 MB SDRAM (code/rodata spot match;
+  BSS/heap diverge from `0x1C14DC` as expected); driver bytes
+  disassemble identically from the unpack. Bootloader table at
+  `boot.bin` `0x4B0–0x52C` (flash/SDRAM/len words incl. staging
+  `0x0DDEFA20`/`0x0DDEFC1C`) cited as corroboration, not load-bearing.
+- Outer caller (in_asm hot-TB attempt + unpack xref + live RSP
+  breakpoint — RSP authoritative): `0x0C0FCD6C–0x0C0FCE52` is one
+  function (gate → strobe `0x0C0FCD0E` r4=`0x10` → sampler
+  `0x0C0FC8FA` → assembly `0x0C0FCE14–38`); 0 BSR/BRA callers (register-
+  indirect, as predicted). Two literal-pool call sites: servo
+  `0x0C0FF7D4`-family at `0x0C0FF86A/86C` (via `[0x0C0FF9EC]`,
+  comparison `0x0C0FF86E+`) and audio/player `0x0C103984`-family at
+  `0x0C1039B2/B4` (via `[0x0C103A60]`, comparison `0x0C1039B6+`).
+  Live break at `0x0C0FCD6C` (40 s) lands pr=`0x0C0FF86E` (servo
+  caller hot, r3=`0x0C0FCD6C`). In_asm gap recorded honestly (driver
+  TBs `0x0C0FC6xx+` absent from the translation window, as in 8b).
+  AUDIO-vs-SERVO owner split (8b concern 1): SHARED routine, both
+  tasks call it — resolved as shared, not owned.
+- Carve: NONE (BLOCKED). 519-B init image and 284-B `0x0CE4B6F4`
+  candidate both absent from packed AND unpacked MAIN (byte search);
+  candidate offset `0xE4B6F4` lies beyond the `0x39231E` image
+  (runtime heap). Mode 5 predicts a host program, but no contiguous
+  blob exists in MAIN — the upload stream is assembled from scattered
+  immediates/tables, or the SHI payload shape is still misread. Next
+  task needs SHI-protocol analysis (UM App. A Bootstrap ROM is public)
+  or a logic-analyzer capture; do NOT guess.

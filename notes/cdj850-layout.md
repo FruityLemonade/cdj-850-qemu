@@ -49,3 +49,31 @@ Decode: byte-send `0x0C0FCC68` emits 5 PEDRL words per call
 - Census decision: opcode census N/A (not code) → no
   interpreter-vs-vendor core call from this image; the genuine reply
   needs DSP-side execution semantics (Task 8c report).
+
+## Packed-MAIN → SDRAM decoder map (Task 8d, VERIFIED)
+
+Carved with `scripts/firmware/c850_unpack.py::decode_main()` (same
+Okumura/Yoshizaki codec as `lzss_decode.py`: ring 4096, init `0x20`,
+pos 4078; unpack the whole `main_flat.bin`, not the stream alone —
+the 6390-B pad is consumed by the decoder overrun exactly as the
+bootloader consumes it):
+
+- Packed field: `main_flat` `0x20–0x19E70A` (4-B BE32 length
+  `0x0019E6E6` + stream) = UPD flat `0x060020–0x1FE70A`.
+- Unpacked: SDRAM `0x0C000000–0x0C39231E` (3744542 B, `0x39231E`).
+- SHA-256 (unpacked):
+  `26c8bfe933afc1e08a05dc65513303f1343a570d1e87f2734d60316e87c01591`.
+- Remainder: `main_flat` `0x19E70A–0x1A0000` (6390 B checksum + zero
+  pad; head bytes `FB71`, rest zeros).
+- Verification (2026-10-13): output matches a live-boot 32 MB SDRAM
+  dump over code/rodata (spot-checked at `0/0x100/0x1000/0x10000/
+  0x100000/0x18BF2C`; BSS/heap diverge at runtime from `0x1C14DC`
+  as expected); driver code (`0x0C0FC9DC`, gates, send, sampler,
+  `0x0C0FCD6C–0x0C0FCE52`, callers) disassembles identically from
+  the unpack as from live SDRAM dumps.
+- Negative search (same date): the 519-B init image (head
+  `8BA08C80…`) and the 284-B `0x0CE4B6F4` candidate header
+  (`000B000000330057…`) are both ABSENT from the packed AND
+  unpacked bytes — no contiguous DSP program blob lives in MAIN.
+  (The candidate sits at SDRAM offset `0xE4B6F4`, beyond the
+  `0x39231E` image — runtime heap, not image.)
