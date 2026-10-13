@@ -1,3 +1,3 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # The CDJ-850 MAIN board (SH7263/SH-2A), in bring-up.
-sh4_ss.add(when: 'CONFIG_CDJ850', if_true: files('board.c'))
+sh4_ss.add(when: 'CONFIG_CDJ850', if_true: files('board.c', 'xc/cmt.c'))
