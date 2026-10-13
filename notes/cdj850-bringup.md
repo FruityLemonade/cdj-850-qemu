@@ -490,3 +490,44 @@ TCBs). Full report:
   releases it with driver-justified semantics). 8b/8c/8d stop
   honestly (no carve target, no SHA, no core, no audio hook).
   No code changed this slice (harness removed; tree == 07df07e).
+
+## Task 8b: send-buffer + reply validation mapped, carve BLOCKED (2026-10-13)
+
+Full report:
+.superpowers/sdd/2026-10-12-cdj850-support/task-8b-report.md.
+EB `~/qemu-build-eb/qemu-system-sh4eb`, BASE `cfacebc`. Capstone
+SH-2A + hand-decode (MOVU.B/BLD gaps vs `translate.c`); `-d in_asm`
+spot-check only (driver TBs absent from the window — stated in
+report). Live GDB RSP + `info registers` + `CDJ850_TRACE` + standing
+32 MB SDRAM dumps.
+
+- Send chain: transfer `0x0C0FC9DC` (5× loop, delay `0x0C107932`,
+  helpers `0x0C0C688A/94`, sampler `0x0C0FC8FA`, `bld.b` reply test)
+  → mirrors `0x0CEE34B0/84` → port `0xFFFE3A02/06` (`+0x202`,
+  phases `0x1C0/0xF1C0` live) → send `0x0C0FCC68/0x0FCD0E`
+  (`r4` byte, BSR-only callers) → callers `0x0C0FCAC0/0x0FCBEA`
+  (`r12/r14/r11/r13` bytes) → gates `0x0C0FCA7A/0x0FCBB0`
+  (wait PE6 then PE8) → bring-up `0x0C0FD7A8/0x0FD7CC`
+  (`r4=0x0CE4B5DA`, `pr=0x0C0FC36A` live). Trace: 2–3 words
+  (`0x5080/0xB080/0xD080`, 2650–2696 ms) then gate-spin at
+  `0x0C0FCBB0` — full program never clocked out.
+- Sequencer `0x0C0FDA2C–0x0FDC1E`: 36 hardcoded `(index,data)` via
+  `0x0C0FCA5E` (delay-aware parse; 26 such sequencers repo-wide —
+  AUDIO-vs-SERVO owner unknown). Control writes, not claimed as
+  program. Candidate `0x0CE4B6F4–0x0CE4B810` (284 B, header +
+  `07FF…`) has no reader refs and is absent from UPD/main/boot
+  contiguously (packed MAIN, entropy 7.55) — carving it would be a
+  guess. Refused. No SHA pinned, `notes/cdj850-layout.md` untouched,
+  `MODEL_EXPECTED` untouched.
+- Reply: sampler `0x0C0FC8FA` → byte `0x0C7F6D6C`; collector
+  `0x0C0FC8DC` → 10 B `0x0C7F6D1C` (live zeros/`0x11`, frozen);
+  validator `0x0C0FC71C–0x0FC87E` checks `0x0C7F6D6C`,
+  `0x0C7F6D5C+2`, `0x0C7F6D67`, `0x0C7F6D02`, `0x0CE4B8A6`,
+  `0x0C7F6AE9` — accept stores `1→0x0CE4B8F5` via `0x0C104D64`,
+  reject calls `0x0C104E6A`, return `0x0C104EE2`. Never accepted
+  live.
+- Rename `mbox.c→ssi.c` deferred (forensics-only slice; tree-wide
+  touch rides with the next code task). No carve script (would emit
+  a guess). 8c inherits: unblock packed-MAIN→SDRAM + AUDIO/SERVO
+  owner first; census starts at the 36-pair table + other 25
+  sequencers + candidate block (unpinned).
