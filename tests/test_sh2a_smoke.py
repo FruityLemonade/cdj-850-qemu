@@ -32,6 +32,19 @@ Pre-patch the first movi20 raises an illegal-instruction exception, so no
 result word (not even the sentinel) is ever written; the blob's handler
 records the fault PC for the failure message: RED. Post-patch every word
 matches: GREEN. Skipped cleanly when the emulator binary is absent.
+
+Task 6d adds two more blobs in the same vehicle:
+
+- nott (0x0068, SH-2A-only per binutils opcodes/sh-opc.h `{"nott", ...}`,
+  Renesas SH-2A/SH2A-FPU Software Manual section 6.3.28, and
+  sim/sh/gencode.c `SET_SR_T (T == 0)`): the first-task fault word from
+  Task 6c (0x0C08EFCA, EXPEVT=0x180). RED pre-patch faults at the first
+  nott exactly like the firmware; GREEN post-patch records the toggles.
+- no-RB-banking: the SH-2A SR has no RB bit (SH-2A Software Manual
+  section 2.2.2), so an ldc of an RB-set SR must not switch the R0-R7
+  bank (the Task 6c pool-2 root cause). RED pre-patch the bank switches
+  and the recorded words mismatch; GREEN post-patch everything stays on
+  bank 0 and SR reads back without RB.
 """
 import json
 import os
@@ -302,6 +315,104 @@ def build_blob():
     return b.bytes(), want
 
 
+def build_nott_blob():
+    """Returns (blob_bytes, expected_words, first_nott_off). T-bit toggles
+    through nott (0x0068): 0->1, 1->0, and a double toggle from 1 back to 1,
+    each observed via movt. Encoding/semantics per binutils opcodes/sh-opc.h
+    (`0000000001101000 nott`, arch_sh2a_nofpu_up) and the Renesas SH-2A
+    manual section 6.3.28 (`~T -> T`)."""
+    b = Blob()
+    want = []
+    R = 11
+
+    def rec(v):
+        want.append(v & 0xFFFFFFFF)
+
+    def rec_reg(r):
+        b.store_cursor(r, R)
+
+    prologue(b)
+
+    b.w16(0x0008)             # clrt (T=0)
+    first_off = 2 * len(b.words)
+    b.w16(0x0068)             # nott -> T=1
+    b.w16(0x0029 | (6 << 8))  # movt R6
+    rec(1)
+    rec_reg(6)
+
+    b.w16(0x0068)             # nott -> T=0
+    b.w16(0x0029 | (6 << 8))  # movt R6
+    rec(0)
+    rec_reg(6)
+
+    b.w16(0x0018)             # sett (T=1)
+    b.w16(0x0068)             # nott -> T=0
+    b.w16(0x0068)             # nott -> T=1
+    b.w16(0x0029 | (6 << 8))  # movt R6
+    rec(1)
+    rec_reg(6)
+
+    b.movl_pc(0, 0x51454D55)
+    rec(0x51454D55)
+    rec_reg(0)
+    b.w16(0xAFFE)             # bra-self
+
+    emit_handler(b)
+    return b.bytes(), want, first_off
+
+
+def build_norb_blob():
+    """Returns (blob_bytes, expected_words). The SH-2A has no SR.RB bit, so
+    ldc of an RB-set value must leave the R0-R7 bank alone and SR must read
+    back without RB. Pre-patch (SH-4 banking applied to -cpu sh2a) the bank
+    switches and every word below mismatches."""
+    b = Blob()
+    want = []
+    R = 11
+
+    def rec(v):
+        want.append(v & 0xFFFFFFFF)
+
+    def rec_reg(r):
+        b.store_cursor(r, R)
+
+    def ldc_imm(v):
+        b.movl_pc(0, v)
+        b.w16(0x400E)         # ldc R0,SR
+
+    prologue(b)
+    # Prologue's ldc loaded 0x600000F0 (RB=1): post-fix RB is dropped by the
+    # translator, so the whole blob runs on bank 0.
+    b.mov(1, 0x11)
+    ldc_imm(0x400000E0)       # RB=0: bank must not change either way
+    b.w16(0x6000 | (6 << 8) | (1 << 4) | 3)  # mov R1,R6
+    rec(0x11)
+    rec_reg(6)
+
+    # Attempt to set RB=1, write, then clear: post-fix the write is visible.
+    ldc_imm(0x600000F0)       # RB=1 attempt: must be ignored
+    b.mov(1, 0x22)
+    ldc_imm(0x400000E0)
+    b.w16(0x6000 | (6 << 8) | (1 << 4) | 3)  # mov R1,R6
+    rec(0x22)
+    rec_reg(6)
+
+    # SR reads back without the RB bit (gen_read_sr ORs into Rd: zero first).
+    ldc_imm(0x600000F0)       # RB=1 attempt again
+    b.mov(6, 0)
+    b.w16(0x0002 | (6 << 8))  # stc SR,R6
+    rec(0x400000F0)           # MD|IMASK=15, RB clear
+    rec_reg(6)
+
+    b.movl_pc(0, 0x51454D55)
+    rec(0x51454D55)
+    rec_reg(0)
+    b.w16(0xAFFE)             # bra-self
+
+    emit_handler(b)
+    return b.bytes(), want
+
+
 def qemu_binary():
     if "GUI_QEMU" in os.environ:
         cand = os.environ["GUI_QEMU"]
@@ -482,6 +593,63 @@ def test_sh2a_32bit_groups(tmp_path):
                     "words were recorded"
                     % ([hex(pc) for pc in fault_pcs], cpu))
     pytest.fail("neither GREEN nor clean RED: sentinel %#x, fault PCs %s, "
+                "cpu=%s, log tail %r"
+                % (got[len(want) - 1],
+                   [hex(pc) for pc in fault_pcs], cpu, log_tail()))
+
+
+def test_sh2a_nott(tmp_path):
+    """nott (0x0068) toggles T. Pre-patch it faults like the Task 6c
+    firmware site (0x0C08EFCA, EXPEVT=0x180): RED. Post-patch GREEN."""
+    qemu = qemu_binary()
+    blob, want, first_off = build_nott_blob()
+    cpu = pick_cpu(qemu)
+    dump, log_tail = run_guest(qemu, cpu, blob, tmp_path, "nott")
+    assert len(dump) == DUMP_SIZE, \
+        "short pmemsave (%d bytes, cpu=%s, log tail %r)" \
+        % (len(dump), cpu, log_tail())
+    got = u32s(dump, RES_PHYS, len(want))
+    fault_pcs = u32s(dump, FAULT_PHYS, 2)  # [SPC, stack top]
+    if got[len(want) - 1] == 0x51454D55:
+        # GREEN: the blob ran to the end; every word must match.
+        bad = [(i, hex(a), hex(b)) for i, (a, b) in
+               enumerate(zip(want, got)) if a != b]
+        assert not bad, \
+            "cpu=%s %d/%d mismatch, first: %s" % (cpu, len(bad),
+                                                 len(want), bad[:8])
+        return
+    if any(pc == BASE + first_off for pc in fault_pcs):
+        pytest.fail("RED (expected pre-patch): illegal instruction at "
+                    "the first nott (fault PCs %s, cpu=%s); no result "
+                    "words were recorded"
+                    % ([hex(pc) for pc in fault_pcs], cpu))
+    pytest.fail("neither GREEN nor clean RED: sentinel %#x, fault PCs %s, "
+                "cpu=%s, log tail %r"
+                % (got[len(want) - 1],
+                   [hex(pc) for pc in fault_pcs], cpu, log_tail()))
+
+
+def test_sh2a_no_rb_banking(tmp_path):
+    """An ldc of an RB-set SR must not bank R0-R7 on -cpu sh2a, and SR must
+    read back without RB. Pre-patch the bank switches (Task 6c pool-2 root
+    cause) and the recorded words mismatch: RED. Post-patch GREEN."""
+    qemu = qemu_binary()
+    blob, want = build_norb_blob()
+    cpu = pick_cpu(qemu)
+    dump, log_tail = run_guest(qemu, cpu, blob, tmp_path, "norb")
+    assert len(dump) == DUMP_SIZE, \
+        "short pmemsave (%d bytes, cpu=%s, log tail %r)" \
+        % (len(dump), cpu, log_tail())
+    got = u32s(dump, RES_PHYS, len(want))
+    fault_pcs = u32s(dump, FAULT_PHYS, 2)  # [SPC, stack top]
+    if got[len(want) - 1] == 0x51454D55:
+        bad = [(i, hex(a), hex(b)) for i, (a, b) in
+               enumerate(zip(want, got)) if a != b]
+        assert not bad, \
+            "cpu=%s RED (RB banking still active) %d/%d mismatch, first: %s" \
+            % (cpu, len(bad), len(want), bad[:8])
+        return
+    pytest.fail("blob did not reach the sentinel: sentinel %#x, fault PCs %s, "
                 "cpu=%s, log tail %r"
                 % (got[len(want) - 1],
                    [hex(pc) for pc in fault_pcs], cpu, log_tail()))

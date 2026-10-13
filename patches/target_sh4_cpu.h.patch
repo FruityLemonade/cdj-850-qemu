@@ -1,5 +1,5 @@
 diff --git a/target/sh4/cpu.h b/target/sh4/cpu.h
-index d928bcf..4e2f369 100644
+index d928bcf..458df79 100644
 --- a/target/sh4/cpu.h
 +++ b/target/sh4/cpu.h
 @@ -31,6 +31,7 @@
@@ -87,7 +87,7 @@ index d928bcf..4e2f369 100644
  /**
   * SuperHCPU:
   * @env: #CPUSH4State
-@@ -372,12 +430,19 @@ static inline target_ulong cpu_read_sr(CPUSH4State *env)
+@@ -372,12 +430,23 @@ static inline target_ulong cpu_read_sr(CPUSH4State *env)
                       (env->sr_t << SR_T);
  }
  
@@ -103,11 +103,15 @@ index d928bcf..4e2f369 100644
 +    /* SH-2A is always privileged -- see SH_FEATURE_SH2A. */
 +    if (env->features & SH_FEATURE_SH2A) {
 +        env->sr |= (1u << SR_MD);
++        /* No RB bit on SH-2A (manual section 2.2.2): keep env->sr RB-free so
++         * no path (GDB writes via this helper included) can re-arm R0-R7
++         * banking behind the translator's back. SH-4 guests unaffected. */
++        env->sr &= ~(1u << SR_RB);
 +    }
  }
  
  static inline void cpu_get_tb_cpu_state(CPUSH4State *env, vaddr *pc,
-@@ -395,4 +460,44 @@ static inline void cpu_get_tb_cpu_state(CPUSH4State *env, vaddr *pc,
+@@ -395,4 +464,44 @@ static inline void cpu_get_tb_cpu_state(CPUSH4State *env, vaddr *pc,
  #endif
  }
  

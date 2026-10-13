@@ -1,5 +1,5 @@
 diff --git a/target/sh4/translate.c b/target/sh4/translate.c
-index 53b0921..ca4061e 100644
+index 53b0921..7e54456 100644
 --- a/target/sh4/translate.c
 +++ b/target/sh4/translate.c
 @@ -46,6 +46,19 @@ typedef struct DisasContext {
@@ -31,7 +31,7 @@ index 53b0921..ca4061e 100644
  
  /* global register indexes */
  static TCGv cpu_gregs[32];
-@@ -195,10 +210,21 @@ static void gen_read_sr(TCGv dst)
+@@ -195,10 +210,29 @@ static void gen_read_sr(TCGv dst)
      tcg_gen_or_i32(dst, cpu_sr, t0);
  }
  
@@ -46,15 +46,23 @@ index 53b0921..ca4061e 100644
 +     * SR must not be able to drop the core into user mode. See
 +     * SH_FEATURE_SH2A -- without this the GUI firmware's cache init loses
 +     * access to the whole on-chip region above 0xE0000000.
++     *
++     * SH-2A likewise has no RB bit (SH-2A Software Manual, section 2.2.2),
++     * so the same write must not arm R0-R7 banking either: from-zero LDCs
++     * (pool-2 registration at 0x0C0C64B0/0x0C0C64C8 on the CDJ-850) would
++     * otherwise strand registers in bank 1 while later TBs translate for
++     * bank 0. Clearing here keeps env->sr RB-free no matter what value the
++     * guest writes; SH-4 guests are unaffected.
 +     */
 +    if (ctx->features & SH_FEATURE_SH2A) {
 +        tcg_gen_ori_i32(cpu_sr, cpu_sr, 1u << SR_MD);
++        tcg_gen_andi_i32(cpu_sr, cpu_sr, ~(1u << SR_RB));
 +    }
 +
      tcg_gen_extract_i32(cpu_sr_q, src, SR_Q, 1);
      tcg_gen_extract_i32(cpu_sr_m, src, SR_M, 1);
      tcg_gen_extract_i32(cpu_sr_t, src, SR_T, 1);
-@@ -217,16 +243,232 @@ static inline void gen_save_cpu_state(DisasContext *ctx, bool save_pc)
+@@ -217,16 +251,232 @@ static inline void gen_save_cpu_state(DisasContext *ctx, bool save_pc)
      }
  }
  
@@ -287,7 +295,7 @@ index 53b0921..ca4061e 100644
      return translator_use_goto_tb(&ctx->base, dest);
  }
  
-@@ -241,6 +483,7 @@ static void gen_goto_tb(DisasContext *ctx, int n, target_ulong dest)
+@@ -241,6 +491,7 @@ static void gen_goto_tb(DisasContext *ctx, int n, target_ulong dest)
          if (use_exit_tb(ctx)) {
              tcg_gen_exit_tb(NULL, 0);
          } else {
@@ -295,7 +303,7 @@ index 53b0921..ca4061e 100644
              tcg_gen_lookup_and_goto_ptr();
          }
      }
-@@ -250,6 +493,22 @@ static void gen_goto_tb(DisasContext *ctx, int n, target_ulong dest)
+@@ -250,6 +501,22 @@ static void gen_goto_tb(DisasContext *ctx, int n, target_ulong dest)
  static void gen_jump(DisasContext * ctx)
  {
      if (ctx->delayed_pc == -1) {
@@ -318,7 +326,7 @@ index 53b0921..ca4061e 100644
          /* Target is not statically known, it comes necessarily from a
             delayed jump as immediate jump are conditinal jumps */
          tcg_gen_mov_i32(cpu_pc, cpu_delayed_pc);
-@@ -257,6 +516,7 @@ static void gen_jump(DisasContext * ctx)
+@@ -257,6 +524,7 @@ static void gen_jump(DisasContext * ctx)
          if (use_exit_tb(ctx)) {
              tcg_gen_exit_tb(NULL, 0);
          } else {
@@ -326,7 +334,7 @@ index 53b0921..ca4061e 100644
              tcg_gen_lookup_and_goto_ptr();
          }
          ctx->base.is_jmp = DISAS_NORETURN;
-@@ -265,6 +525,27 @@ static void gen_jump(DisasContext * ctx)
+@@ -265,6 +533,27 @@ static void gen_jump(DisasContext * ctx)
      }
  }
  
@@ -354,7 +362,7 @@ index 53b0921..ca4061e 100644
  /* Immediate conditional jump (bt or bf) */
  static void gen_conditional_jump(DisasContext *ctx, target_ulong dest,
                                   bool jump_if_true)
-@@ -388,6 +669,15 @@ static inline void gen_store_fpr64(DisasContext *ctx, TCGv_i64 t, int reg)
+@@ -388,6 +677,15 @@ static inline void gen_store_fpr64(DisasContext *ctx, TCGv_i64 t, int reg)
  
  static void _decode_opc(DisasContext * ctx)
  {
@@ -370,7 +378,7 @@ index 53b0921..ca4061e 100644
      /* This code tries to make movcal emulation sufficiently
         accurate for Linux purposes.  This instruction writes
         memory, and prior to that, always allocates a cache line.
-@@ -434,6 +724,24 @@ static void _decode_opc(DisasContext * ctx)
+@@ -434,6 +732,24 @@ static void _decode_opc(DisasContext * ctx)
          tcg_gen_mov_i32(cpu_delayed_pc, cpu_pr);
          ctx->envflags |= TB_FLAG_DELAY_SLOT;
          ctx->delayed_pc = (uint32_t) - 1;
@@ -395,7 +403,21 @@ index 53b0921..ca4061e 100644
          return;
      case 0x0028: /* clrmac */
          tcg_gen_movi_i32(cpu_mach, 0);
-@@ -452,7 +760,37 @@ static void _decode_opc(DisasContext * ctx)
+@@ -445,6 +761,13 @@ static void _decode_opc(DisasContext * ctx)
+     case 0x0008: /* clrt */
+         tcg_gen_movi_i32(cpu_sr_t, 0);
+         return;
++    case 0x0068: /* nott -- SH-2A: T = ~T (SH-2A manual 6.3.28; 0x0068 faults
++                    the CDJ-850 first task at 0x0C08EFCA pre-patch) */
++        if (!sh2a) {
++            break;
++        }
++        tcg_gen_xori_i32(cpu_sr_t, cpu_sr_t, 1);
++        return;
+     case 0x0038: /* ldtlb */
+         CHECK_PRIVILEGED
+         gen_helper_ldtlb(tcg_env);
+@@ -452,7 +775,37 @@ static void _decode_opc(DisasContext * ctx)
      case 0x002b: /* rte */
          CHECK_PRIVILEGED
          CHECK_NOT_DELAY_SLOT
@@ -434,7 +456,7 @@ index 53b0921..ca4061e 100644
          tcg_gen_mov_i32(cpu_delayed_pc, cpu_spc);
          ctx->envflags |= TB_FLAG_DELAY_SLOT_RTE;
          ctx->delayed_pc = (uint32_t) - 1;
-@@ -532,9 +870,23 @@ static void _decode_opc(DisasContext * ctx)
+@@ -532,9 +885,23 @@ static void _decode_opc(DisasContext * ctx)
      case 0xd000: /* mov.l @(disp,PC),Rn */
          CHECK_NOT_DELAY_SLOT
          {
@@ -459,7 +481,7 @@ index 53b0921..ca4061e 100644
          }
          return;
      case 0x7000: /* add #imm,Rn */
-@@ -553,6 +905,248 @@ static void _decode_opc(DisasContext * ctx)
+@@ -553,6 +920,248 @@ static void _decode_opc(DisasContext * ctx)
          return;
      }
  
@@ -708,7 +730,49 @@ index 53b0921..ca4061e 100644
      switch (ctx->opcode & 0xf00f) {
      case 0x6003: /* mov Rm,Rn */
          tcg_gen_mov_i32(REG(B11_8), REG(B7_4));
-@@ -1338,6 +1932,7 @@ static void _decode_opc(DisasContext * ctx)
+@@ -1305,22 +1914,41 @@ static void _decode_opc(DisasContext * ctx)
+         return;
+     }
+ 
++    /*
++     * SH-3 banked-register moves. SH-2A has no banked R0-R7 (no SR.RB), so
++     * on an SH-2A core these encodings are reserved and must fault: silently
++     * scribbling the shadow bank would re-open the banking hazard class the
++     * gbank force-off below closes. binutils sh-opc.h tags all four
++     * arch_sh3_nommu_up (SH-3 only, never SH-2A); SH-4 guests are unaffected.
++     */
+     switch (ctx->opcode & 0xf08f) {
+     case 0x408e: /* ldc Rm,Rn_BANK */
++        if (sh2a) {
++            goto do_illegal;
++        }
+         CHECK_PRIVILEGED
+         tcg_gen_mov_i32(ALTREG(B6_4), REG(B11_8));
+         return;
+     case 0x4087: /* ldc.l @Rm+,Rn_BANK */
++        if (sh2a) {
++            goto do_illegal;
++        }
+         CHECK_PRIVILEGED
+         tcg_gen_qemu_ld_i32(ALTREG(B6_4), REG(B11_8), ctx->memidx,
+                             MO_TESL | MO_ALIGN);
+         tcg_gen_addi_i32(REG(B11_8), REG(B11_8), 4);
+         return;
+     case 0x0082: /* stc Rm_BANK,Rn */
++        if (sh2a) {
++            goto do_illegal;
++        }
+         CHECK_PRIVILEGED
+         tcg_gen_mov_i32(REG(B11_8), ALTREG(B6_4));
+         return;
+     case 0x4083: /* stc.l Rm_BANK,@-Rn */
++        if (sh2a) {
++            goto do_illegal;
++        }
+         CHECK_PRIVILEGED
+         {
+             TCGv addr = tcg_temp_new();
+@@ -1338,6 +1966,7 @@ static void _decode_opc(DisasContext * ctx)
          tcg_gen_addi_i32(cpu_delayed_pc, REG(B11_8), ctx->base.pc_next + 4);
          ctx->envflags |= TB_FLAG_DELAY_SLOT;
          ctx->delayed_pc = (uint32_t) - 1;
@@ -716,7 +780,7 @@ index 53b0921..ca4061e 100644
          return;
      case 0x0003: /* bsrf Rn */
          CHECK_NOT_DELAY_SLOT
-@@ -1345,6 +1940,7 @@ static void _decode_opc(DisasContext * ctx)
+@@ -1345,6 +1974,7 @@ static void _decode_opc(DisasContext * ctx)
          tcg_gen_add_i32(cpu_delayed_pc, REG(B11_8), cpu_pr);
          ctx->envflags |= TB_FLAG_DELAY_SLOT;
          ctx->delayed_pc = (uint32_t) - 1;
@@ -724,7 +788,7 @@ index 53b0921..ca4061e 100644
          return;
      case 0x4015: /* cmp/pl Rn */
          tcg_gen_setcondi_i32(TCG_COND_GT, cpu_sr_t, REG(B11_8), 0);
-@@ -1361,6 +1957,9 @@ static void _decode_opc(DisasContext * ctx)
+@@ -1361,6 +1991,9 @@ static void _decode_opc(DisasContext * ctx)
          tcg_gen_mov_i32(cpu_delayed_pc, REG(B11_8));
          ctx->envflags |= TB_FLAG_DELAY_SLOT;
          ctx->delayed_pc = (uint32_t) - 1;
@@ -734,7 +798,7 @@ index 53b0921..ca4061e 100644
          return;
      case 0x400b: /* jsr @Rn */
          CHECK_NOT_DELAY_SLOT
-@@ -1368,13 +1967,16 @@ static void _decode_opc(DisasContext * ctx)
+@@ -1368,13 +2001,16 @@ static void _decode_opc(DisasContext * ctx)
          tcg_gen_mov_i32(cpu_delayed_pc, REG(B11_8));
          ctx->envflags |= TB_FLAG_DELAY_SLOT;
          ctx->delayed_pc = (uint32_t) - 1;
@@ -752,7 +816,7 @@ index 53b0921..ca4061e 100644
              ctx->base.is_jmp = DISAS_STOP;
          }
          return;
-@@ -1385,7 +1987,7 @@ static void _decode_opc(DisasContext * ctx)
+@@ -1385,7 +2021,7 @@ static void _decode_opc(DisasContext * ctx)
              tcg_gen_qemu_ld_i32(val, REG(B11_8), ctx->memidx,
                                  MO_TESL | MO_ALIGN);
              tcg_gen_andi_i32(val, val, 0x700083f3);
@@ -761,7 +825,7 @@ index 53b0921..ca4061e 100644
              tcg_gen_addi_i32(REG(B11_8), REG(B11_8), 4);
              ctx->base.is_jmp = DISAS_STOP;
          }
-@@ -1448,7 +2050,7 @@ static void _decode_opc(DisasContext * ctx)
+@@ -1448,7 +2084,7 @@ static void _decode_opc(DisasContext * ctx)
      case 0x406a: /* lds Rm,FPSCR */
          CHECK_FPU_ENABLED
          gen_helper_ld_fpscr(tcg_env, REG(B11_8));
@@ -770,7 +834,7 @@ index 53b0921..ca4061e 100644
          return;
      case 0x4066: /* lds.l @Rm+,FPSCR */
          CHECK_FPU_ENABLED
-@@ -1458,7 +2060,7 @@ static void _decode_opc(DisasContext * ctx)
+@@ -1458,7 +2094,7 @@ static void _decode_opc(DisasContext * ctx)
                                  MO_TESL | MO_ALIGN);
              tcg_gen_addi_i32(REG(B11_8), REG(B11_8), 4);
              gen_helper_ld_fpscr(tcg_env, addr);
@@ -779,7 +843,7 @@ index 53b0921..ca4061e 100644
          }
          return;
      case 0x006a: /* sts FPSCR,Rn */
-@@ -1504,6 +2106,12 @@ static void _decode_opc(DisasContext * ctx)
+@@ -1504,6 +2140,12 @@ static void _decode_opc(DisasContext * ctx)
      case 0x0029: /* movt Rn */
          tcg_gen_mov_i32(REG(B11_8), cpu_sr_t);
          return;
@@ -792,7 +856,7 @@ index 53b0921..ca4061e 100644
      case 0x0073:
          /* MOVCO.L
           *     LDST -> T
-@@ -1794,12 +2402,91 @@ static void _decode_opc(DisasContext * ctx)
+@@ -1794,12 +2436,91 @@ static void _decode_opc(DisasContext * ctx)
      return;
  }
  
@@ -884,7 +948,7 @@ index 53b0921..ca4061e 100644
      if (old_flags & TB_FLAG_DELAY_SLOT_MASK) {
          /* go out of the delay slot */
          ctx->envflags &= ~TB_FLAG_DELAY_SLOT_MASK;
-@@ -1816,6 +2503,10 @@ static void decode_opc(DisasContext * ctx)
+@@ -1816,6 +2537,10 @@ static void decode_opc(DisasContext * ctx)
          ctx->envflags &= ~TB_FLAG_GUSA_MASK;
  
          tcg_gen_movi_i32(cpu_flags, ctx->envflags);
@@ -895,9 +959,26 @@ index 53b0921..ca4061e 100644
          if (old_flags & TB_FLAG_DELAY_SLOT_COND) {
              gen_delayed_conditional_jump(ctx);
          } else {
-@@ -2210,6 +2901,13 @@ static void sh4_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
-     ctx->gbank = ((tbflags & (1 << SR_MD)) &&
-                   (tbflags & (1 << SR_RB))) * 0x10;
+@@ -2207,9 +2932,28 @@ static void sh4_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
+     ctx->delayed_pc = -1; /* use delayed pc from env pointer */
+     ctx->features = cpu_env(cs)->features;
+     ctx->has_movcal = (tbflags & TB_FLAG_PENDING_MOVCA);
+-    ctx->gbank = ((tbflags & (1 << SR_MD)) &&
+-                  (tbflags & (1 << SR_RB))) * 0x10;
++    /*
++     * SH-2A has no SR.RB and no banked R0-R7 (SH-2A Software Manual,
++     * section 2.2.2): every TB translates for bank 0. Without this, a stale
++     * RB bit in env->sr (reset value, or a guest LDC that predates the
++     * gen_write_sr mask) would silently divert all R0-R7 accesses to the
++     * shadow bank -- the CDJ-850 pool-2 failure of Task 6c. The expression
++     * for other cores is unchanged.
++     */
++    if (ctx->features & SH_FEATURE_SH2A) {
++        ctx->gbank = 0;
++    } else {
++        ctx->gbank = ((tbflags & (1 << SR_MD)) &&
++                      (tbflags & (1 << SR_RB))) * 0x10;
++    }
      ctx->fbank = tbflags & FPSCR_FR ? 0x10 : 0;
 +    ctx->cdj_jkind = CDJ_EXIT_UNKNOWN;
 +    ctx->cdj_pred_ok = false;
@@ -909,42 +990,12 @@ index 53b0921..ca4061e 100644
  
  #ifdef CONFIG_USER_ONLY
      if (tbflags & TB_FLAG_GUSA_MASK) {
-@@ -2250,53 +2948,1175 @@ static void sh4_tr_insn_start(DisasContextBase *dcbase, CPUState *cs)
+@@ -2250,19 +2994,1031 @@ static void sh4_tr_insn_start(DisasContextBase *dcbase, CPUState *cs)
      tcg_gen_insn_start(ctx->base.pc_next, ctx->envflags);
  }
  
 -static void sh4_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
--{
--    CPUSH4State *env = cpu_env(cs);
--    DisasContext *ctx = container_of(dcbase, DisasContext, base);
--
--#ifdef CONFIG_USER_ONLY
--    if (unlikely(ctx->envflags & TB_FLAG_GUSA_MASK)
--        && !(ctx->envflags & TB_FLAG_GUSA_EXCLUSIVE)) {
--        /*
--         * We're in an gUSA region, and we have not already fallen
--         * back on using an exclusive region.  Attempt to parse the
--         * region into a single supported atomic operation.  Failure
--         * is handled within the parser by raising an exception to
--         * retry using an exclusive region.
--         *
--         * Parsing the region in one block conflicts with plugins,
--         * so always use exclusive mode if plugins enabled.
--         */
--        if (ctx->base.plugin_enabled) {
--            gen_restart_exclusive(ctx);
--            ctx->base.pc_next += 2;
--        } else {
--            decode_gusa(ctx, env);
--        }
--        return;
--    }
--#endif
- 
--    ctx->opcode = translator_lduw(env, &ctx->base, ctx->base.pc_next);
--    decode_opc(ctx);
--    ctx->base.pc_next += 2;
--}
++
 +/*
 + * SH-2A 32-bit instructions.
 + *
@@ -966,8 +1017,7 @@ index 53b0921..ca4061e 100644
 + * including undefined second-word sub-opcodes, so the caller falls through
 + * to the 16-bit decoder and raises an illegal instruction as upstream does.
 + */
- 
--static void sh4_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
++
 +/*
 + * The FPU-disabled raise for the 32-bit path. Same emission as the
 + * do_fpu_disabled label in _decode_opc (CHECK_FPU_ENABLED's goto cannot
@@ -976,10 +1026,8 @@ index 53b0921..ca4061e 100644
 + */
 +static bool gen_sh2a_32_fpu_disabled(DisasContext *ctx)
  {
+-    CPUSH4State *env = cpu_env(cs);
 -    DisasContext *ctx = container_of(dcbase, DisasContext, base);
--
--    if (ctx->tbflags & TB_FLAG_GUSA_EXCLUSIVE) {
--        /* Ending the region of exclusivity.  Clear the bits.  */
 +    if (!(ctx->tbflags & (1u << SR_FD))) {
 +        return false;
 +    }
@@ -992,7 +1040,15 @@ index 53b0921..ca4061e 100644
 +    ctx->base.is_jmp = DISAS_NORETURN;
 +    return true;
 +}
-+
+ 
+-#ifdef CONFIG_USER_ONLY
+-    if (unlikely(ctx->envflags & TB_FLAG_GUSA_MASK)
+-        && !(ctx->envflags & TB_FLAG_GUSA_EXCLUSIVE)) {
+-        /*
+-         * We're in an gUSA region, and we have not already fallen
+-         * back on using an exclusive region.  Attempt to parse the
+-         * region into a single supported atomic operation.  Failure
+-         * is handled within the parser by raising an exception to
 +static bool decode_sh2a_32(DisasContext *ctx, CPUSH4State *env)
 +{
 +    uint16_t op = ctx->opcode;
@@ -1974,21 +2030,13 @@ index 53b0921..ca4061e 100644
 +         * back on using an exclusive region.  Attempt to parse the
 +         * region into a single supported atomic operation.  Failure
 +         * is handled within the parser by raising an exception to
-+         * retry using an exclusive region.
-+         *
-+         * Parsing the region in one block conflicts with plugins,
-+         * so always use exclusive mode if plugins enabled.
-+         */
-+        if (ctx->base.plugin_enabled) {
-+            gen_restart_exclusive(ctx);
-+            ctx->base.pc_next += 2;
-+        } else {
-+            decode_gusa(ctx, env);
-+        }
-+        return;
-+    }
-+#endif
-+
+          * retry using an exclusive region.
+          *
+          * Parsing the region in one block conflicts with plugins,
+@@ -2278,9 +4034,95 @@ static void sh4_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
+     }
+ #endif
+ 
 +    /*
 +     * Firmware log tap, see helper_cdj_fwlog(). Placed at translation time so
 +     * it costs one comparison per translated instruction and nothing at run
@@ -2069,26 +2117,19 @@ index 53b0921..ca4061e 100644
 +    if (unlikely(cdj_timed_add(ctx, env))) {
 +        return;
 +    }
-+    ctx->opcode = translator_lduw(env, &ctx->base, ctx->base.pc_next);
+     ctx->opcode = translator_lduw(env, &ctx->base, ctx->base.pc_next);
 +    if ((ctx->features & SH_FEATURE_SH2A) && decode_sh2a_32(ctx, env)) {
 +        ctx->base.pc_next += 4;
 +        return;
 +    }
 +
-+    decode_opc(ctx);
-+    ctx->base.pc_next += 2;
+     decode_opc(ctx);
+     ctx->base.pc_next += 2;
 +    cdj_io_split_check(ctx, ctx->base.pc_next - 2);
-+}
-+
-+static void sh4_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
-+{
-+    DisasContext *ctx = container_of(dcbase, DisasContext, base);
-+
-+    if (ctx->tbflags & TB_FLAG_GUSA_EXCLUSIVE) {
-+        /* Ending the region of exclusivity.  Clear the bits.  */
-         ctx->envflags &= ~TB_FLAG_GUSA_MASK;
-     }
+ }
  
+ static void sh4_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
+@@ -2295,8 +4137,32 @@ static void sh4_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
      switch (ctx->base.is_jmp) {
      case DISAS_STOP:
          gen_save_cpu_state(ctx, true);
