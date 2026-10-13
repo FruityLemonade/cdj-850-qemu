@@ -9,6 +9,9 @@ void cdj850_dsp_init(void);
 /* MAIN write snoop (bring-up tracker + record). pc = guest PC, ms = vms. */
 void cdj850_dsp_snoop_write(hwaddr off, uint64_t val, unsigned size,
                             uint32_t pc, uint64_t ms);
-/* DSP-driven input levels ORed over the stored latch on Port-E reads. */
-uint64_t cdj850_dsp_adjust_read(hwaddr off, unsigned size, uint64_t v);
+/* DSP-driven input levels ORed over the stored latch on Port-E reads.
+ * pc = guest PC performing the read (lets the experimental reply drive
+ * answer only the sampler's two phase reads). */
+uint64_t cdj850_dsp_adjust_read(hwaddr off, unsigned size, uint64_t v,
+                                uint32_t pc);
 #endif

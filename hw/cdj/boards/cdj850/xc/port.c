@@ -66,7 +66,7 @@ static uint64_t cdj850_port_read(void *opaque, hwaddr off, unsigned size)
     }
     /* DSP-driven input levels (HREQ/DSPDREQ+PE6/PE8 READY once the DSP
      * is out of reset; loopback latch before that). */
-    v = cdj850_dsp_adjust_read(off, size, v);
+    v = cdj850_dsp_adjust_read(off, size, v, s->cpu->env.pc);
     if (cdj850_trace()) {
         info_report("cdj850: port read +0x%x size %u = 0x%x at pc=0x%08x "
                     "%" PRIu64 " ms", (unsigned)off, size, (unsigned)v,

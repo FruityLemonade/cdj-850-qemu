@@ -56,6 +56,31 @@
  *    reads return the stored latch there (loopback), exactly as without a
  *    DSP — supplying assembled reply bytes would invent DSP payloads.
  *
+ * 3. EXPERIMENTAL reply drive (Task 8g, user-authorized, default OFF).
+ *    $CDJ850_DSP_REPLY=0xHL (H,L hex digits, each 0-7) makes the model
+ *    drive MAIN's PE15:13 reply-DATA lines the way the real DSPC56371
+ *    PROM application would: sampler 0x0C0FC8FA assembles its reply byte
+ *    at 0x0C7F6D6C from two back-to-back Port-E reads (phase 1 at guest
+ *    pc=0x0C0FC920, phase 2 at pc=0x0C0FC95C; each `and #0xF000, shad
+ *    #-12`, byte = (phase1<<4)|phase2). The model answers phase 1 with
+ *    H and phase 2 with L (PE12/DSPDREQ stays READY=1 either way), so
+ *    the assembled byte is ((H<<1|1)<<4)|(L<<1|1); all other Port-E
+ *    reads see H on PE15:13 (the DSP's quiescent DATA). Unset (or any
+ *    value outside 0x00-0x77) = OFF = pure loopback, byte-identical to
+ *    having no DSP.
+ *    Every driven value is traceable to a validator-read constant: the
+ *    sample byte merges into the flag block at 0x0C7F6D5C (validator
+ *    0x0C0FC7B8-7EA: assemble jsr @0x0C107D9C, and #0xF0, split jsr
+ *    @0x0C107D6A, movu.b sample>>4 OR) whose bytes the validator
+ *    compares against #1 (0x0C0FC7F4 on [0x0C7F6D5E],
+ *    0x0C0FC836 on [0x0C7F6D67]), and the 10 collector bytes at
+ *    0x0C7F6D1C feed 0x0C104D64's low-nibble {0,1,5} + nonzero checks
+ *    (0x0C104D8C-DB2). Static search = H==L (8 values); the full bound
+ *    is the single decisive byte 0x00-0x77 (64 physically distinct
+ *    patterns under PE12=1). Ground truth = pending hardware capture,
+ *    which REPLACES these values; until then they are the
+ *    validator-satisfying set, never committed as always-on behavior.
+ *
  * What this does NOT do (honest limits):
  * - No DSP56371 core executes yet: the opcode census needs a complete
  *   recorded image first (step 3), and the validator's accept leg needs
@@ -88,6 +113,11 @@ typedef struct QEMU_PACKED {
     uint32_t val;
 } Cdj850DspRec;
 
+/* Sampler 0x0C0FC8FA phase-read PCs (Port-E word reads whose high
+ * nibble, PE15:12, becomes the reply byte at 0x0C7F6D6C). */
+#define CDJ850_SAMPLER_PH1_PC 0x0C0FC920u /* phase 1: byte bits 7:4 */
+#define CDJ850_SAMPLER_PH2_PC 0x0C0FC95Cu /* phase 2: byte bits 3:0 */
+
 typedef struct {
     bool alive;
     unsigned bringup;   /* 0, 0x40, 0x140 seen (in order) */
@@ -95,13 +125,39 @@ typedef struct {
     FILE *rec;
     uint64_t n_rec;
     uint64_t n_reads;
+    int reply_hi;       /* -1 = OFF (loopback); else 0-7, phase-1 PE15:13 */
+    int reply_lo;       /* -1 = OFF (loopback); else 0-7, phase-2 PE15:13 */
 } Cdj850Dsp;
 
 static Cdj850Dsp cdj850_dsp;
 
 void cdj850_dsp_init(void)
 {
+    const char *rep;
+
     memset(&cdj850_dsp, 0, sizeof(cdj850_dsp));
+    cdj850_dsp.reply_hi = -1;
+    cdj850_dsp.reply_lo = -1;
+    /* Experimental reply drive (Task 8g): $CDJ850_DSP_REPLY=0xHL,
+     * H,L in 0-7. Default OFF. Parsed once; invalid = OFF + warn. */
+    rep = getenv("CDJ850_DSP_REPLY");
+    if (rep && *rep) {
+        char *end = NULL;
+        unsigned long k = strtoul(rep, &end, 0);
+
+        if (end && *end == '\0' && k <= 0x77 &&
+            ((k >> 4) & 0xF) <= 7 && (k & 0xF) <= 7) {
+            cdj850_dsp.reply_hi = (int)((k >> 4) & 0xF);
+            cdj850_dsp.reply_lo = (int)(k & 0xF);
+            info_report("cdj850: dsp reply: EXPERIMENTAL drive ON "
+                        "(CDJ850_DSP_REPLY=0x%02lx: PE15:13 ph1=%d ph2=%d, "
+                        "PE12 READY stays 1; hardware capture replaces this)",
+                        k, cdj850_dsp.reply_hi, cdj850_dsp.reply_lo);
+        } else {
+            info_report("cdj850: dsp reply: ignoring bad CDJ850_DSP_REPLY "
+                        "'%s' (want 0x00-0x77), OFF", rep);
+        }
+    }
 }
 
 static void cdj850_dsp_open_rec(void)
@@ -177,7 +233,8 @@ void cdj850_dsp_snoop_write(hwaddr off, uint64_t val, unsigned size,
     }
 }
 
-uint64_t cdj850_dsp_adjust_read(hwaddr off, unsigned size, uint64_t v)
+uint64_t cdj850_dsp_adjust_read(hwaddr off, unsigned size, uint64_t v,
+                                uint32_t pc)
 {
     unsigned i;
 
@@ -196,6 +253,26 @@ uint64_t cdj850_dsp_adjust_read(hwaddr off, unsigned size, uint64_t v)
         } else if (a == CDJ850_PEDRL_OFF + 1) {
             /* Low byte: PE6. */
             v |= (uint64_t)CDJ850_DSP_PE6 << ((size - 1 - i) * 8);
+        }
+    }
+    /* Experimental reply drive (Task 8g, default OFF): the DSP owns
+     * PE15:13 DATA. The sampler's two phase reads get H/L; every other
+     * Port-E read sees the quiescent H. PE12/READY is never cleared. */
+    if (cdj850_dsp.reply_hi >= 0) {
+        unsigned shift;
+        int nib3;
+
+        for (i = 0; i < size; i++) {
+            if (off + i != CDJ850_PEDRL_OFF) {
+                continue;
+            }
+            shift = (size - 1 - i) * 8;
+            nib3 = cdj850_dsp.reply_hi;
+            if (pc == CDJ850_SAMPLER_PH2_PC) {
+                nib3 = cdj850_dsp.reply_lo;
+            }
+            v &= ~((uint64_t)0xE0 << shift);
+            v |= (uint64_t)((nib3 & 7) << 5) << shift;
         }
     }
     return v;
