@@ -619,3 +619,49 @@ datasheets live in /tmp only (never committed:
   immediates/tables, or the SHI payload shape is still misread. Next
   task needs SHI-protocol analysis (UM App. A Bootstrap ROM is public)
   or a logic-analyzer capture; do NOT guess.
+
+## Task 8e: SHI-framed reinterpretation + header search + unpacker-PC trace — carve BLOCKED with new evidence (2026-10-13)
+
+Full report:
+.superpowers/sdd/2026-10-12-cdj850-support/task-8e-report.md.
+EB `~/qemu-build-eb/qemu-system-sh4eb`, BASE `694cc05`. No subagents.
+No bridge. No fabricated bytes/replies/vectors. Firmware read-only;
+datasheets in /tmp only (never committed: `/tmp/371UM.pdf` UM Rev 2.1
+404 pp + `/tmp/DSP56300FM.pdf` FM Rev 5 512 pp, re-fetched public
+Motorola docs); derived bytes only in /tmp + untracked `extract/`.
+
+- UM App. A sequence extracted verbatim: SHI slave-SPI bootstrap
+  (HCSR `$A9`: HEN=1, HM=10, HFIFO=1, HMST=0, HRQE=01) takes 3 B
+  count + 3 B start address + 3N B program words into contiguous
+  PRAM, then `jmp (r1)` to the start address; 24-bit words (Table
+  7-3), MSB-first (§7.4), HREQ asserted when IOSR ready + HRX FIFO
+  not full, deasserted at first clock of next word (§7.7.1); PRAM 4K
+  `$000000–$000FFF` (Fig. 3-1); opcode markers FM ch. 13
+  (NOP `$000000`, RTS `$00000C`, REP `$06+Ax`, BRA `$05`,
+  JMP `$0A/$0C/$0D`).
+- 519-B re-parse (`scripts/firmware/c850_shi_search.py` + 4 tests,
+  commit `68e80fa`): 173 words, offset-0 count `0x8BA08C`/`0x8CA08B`
+  (need 171); zero exact-fit offsets in either order; 16-bit /
+  data-only / index-only framings misfit; payload census both
+  orders barren (0 NOP/RTS/REP/BRA; 2 isolated LE JMP singletons in
+  head control bytes; `00Fxxx` words spell the F-bank walk).
+- Header scan: unpacked 4816 structural / 253 vector survivors,
+  packed 88 / 1 — all classes explained (SH `nop`/load opcodes as
+  fake counts; survivors disassemble as valid SH-2A incl. a MAC-loop
+  driver at `0x15EB0` and movi20 code at `0x1D1BC`; BSS hits are SH
+  tables; packed hit is LZSS-stream coincidence); no survivor meets
+  the genuine-program conjunction (pinned in test). Negative redo:
+  full-length `bytes.find` — 519 B and 284-B candidate
+  (`d47e1d71…c125d9fa4`) absent from packed AND unpacked.
+- Unpacker-PC trace (fresh 12 s early `-d in_asm`, 7923 TBs):
+  entry `0x0DDEFA20`, bit head `0x0DDEFA52`, literal store
+  `0x0DDEFA78/7A`, match loop `0x0DDEFAA6`, exit `0x0DDEFAC2`,
+  caller `0x0DDEFBE4`, then `0x0C000000`. Side find: 8d's own
+  in_asm log already contained `0xddefa78` — its case-sensitive
+  `0DDEFA78` grep missed it (corrected, no blame).
+- Carve: NONE (BLOCKED). New evidence for the mode-5-vs-PROM
+  re-examination: the 519 B is phase-1 control fill with no SHI
+  framing; the program upload (if any) sits behind the
+  never-completing reply handshake or is assembled purely from
+  scattered immediates. Suite: full `tests/` 665 passed, 38
+  skipped, 1 xfailed (2026-10-13).

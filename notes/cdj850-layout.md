@@ -77,3 +77,54 @@ bootloader consumes it):
   unpacked bytes — no contiguous DSP program blob lives in MAIN.
   (The candidate sits at SDRAM offset `0xE4B6F4`, beyond the
   `0x39231E` image — runtime heap, not image.)
+
+## SHI-framed hunt (Task 8e, VERIFIED NEGATIVE 2026-10-13)
+
+Tool: `scripts/firmware/c850_shi_search.py` (GPL + tests
+`test_c850_shi_*`, full suite 665 passed / 38 skipped / 1 xfailed).
+UM source: DSP56371UM App. A — SHI slave-SPI bootstrap takes word
+count (3 B) + start address (3 B) + N program words (3 B each),
+MSB-first, 24-bit (HM=10), HCSR `$A9`, HREQ per-word handshake
+(§7.7.1); PRAM 4K `$000000–$000FFF` (Fig. 3-1); opcode markers per
+DSP56300FM ch. 13 (NOP `$000000`, RTS `$00000C`, REP `$06xxxx`
++ `$Ax` low nibble, BRA-short `$05`, JMP `$0A/$0C`, BRA-long `$0D`).
+
+- 519-B re-parse: 173×24-bit + 0 rem. Offset-0 count is `0x8BA08C`
+  (BE) / `0x8CA08B` (LE), never 171 (`0xAB`); NO offset anywhere
+  satisfies count == words-remaining (either order); 16-bit, data-
+  only, and index-only framings misfit equally. Payload census both
+  orders: 173/173 distinct, 0 NOP, 0 RTS, 0 valid REP, 0 BRA-short;
+  the only JMP-family words are 2 isolated LE singletons in head
+  control bytes; the 43 `00Fxxx` BE words spell the F-bank control
+  walk (`00 f1 b7 … 00 f7 d0`), not opcodes; zero-runs ≤ 2 B.
+- Header scan (16≤count≤0x1000, addr PRAM, BE+LE, full-image):
+  unpacked → 4816 structural / 253 vector-table survivors; packed →
+  88 / 1. Every class explained, none genuine: top fake counts are
+  SH opcodes (`0x0900` = SH `nop`+zero, `0x0200/0x0700` = PC-rel
+  loads); examined survivors disassemble as valid SH-2A (e.g.
+  `0x804c`, `0x2100` payload, `0x15EB0` MAC-loop driver,
+  `0x1D1BC` movi20 immediates); BSS-region hits are SH
+  length/address tables; no survivor combines ≥4 distinct vector
+  targets + RTS + valid REP + nonzero reset jump (pinned in test).
+  The packed survivor (`0xE1D36` LE count=1571 addr=`0xA28`) sits
+  inside the LZSS stream: 1567/1571 distinct, 0 NOP/RTS/REP — stream
+  coincidence, rejected.
+- Rigorous negative redo (full-length `bytes.find` to exhaustion):
+  519 B absent from packed (1703936 B) and unpacked (3744542 B);
+  284-B candidate
+  (SHA `d47e1d71…c125d9fa4`, from live SDRAM `0x0CE4B6F4`) absent
+  from both as well.
+- Unpacker loop PCs (fresh 12 s early-window `-d in_asm` trace
+  `/tmp/8e-inasm.main.log`, 7923 TBs; 8d's own log already held
+  them — its exact-case grep `0DDEFA78` missed the lowercase
+  `0xddefa78`): decoder entry `0x0DDEFA20`, bit-test head
+  `0x0DDEFA52`, literal store `0x0DDEFA78`/`0x0DDEFA7A`
+  (`bra 0xddefa52`, `and r1,r2` 4096-ring wrap — matches the
+  committed LZSS ring), match-copy loop `0x0DDEFAA6`
+  (`bra 0xddefaa6`), exit `0x0DDEFAC2`, caller `0x0DDEFBE4`,
+  then jump to unpacked entry `0x0C000000`.
+- Verdict: SHI framing fits nothing and no header exists — carve
+  BLOCKED with new evidence (mode-5-vs-PROM re-examination for the
+  next task: the observed 519 B is phase-1 control fill; the program
+  upload, if any, is gated behind the never-completing reply
+  handshake, or assembled purely from scattered immediates).
