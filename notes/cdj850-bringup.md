@@ -150,3 +150,38 @@ IDs, not RAM power-on.
   (pc 0x0C077C3C, r0=0xFFFE7004). Continue the per-gap loop from there
   with the bridge applied; each new peripheral still gets its own
   commit below.
+
+## Task 6 increment 2: SCIF/serial 0xFFFE7000 (2026-10-13)
+
+Adopted the uncommitted `cdj850_ser_*` stub (+106 lines in board.c):
+kept, with one fix. The stub is sound: setup writes +3/+0/+1/+2/+4/+3
+(0x00/0x80/0x40/0xC5/0x04/0x80 -- SCIF SCSMR/SCBRR/SCSCR-style init),
+1140 TX bytes through +6 with a `read +4, and #4, loop while 0'
+TX-ready poll (driver 0x0C077B06/0x0C077C3C), teardown read +3 / write
++3=0. Bridged boot (`CDJ_RPOKE="0x0c0d0122:0:0x0c400000:72:209715200,
+0x0c0b8db2:0:0,0x0c0ff6c6:0:0,0x0c00570a:0:0"`, see below) sends the
+full packet and the driver completes (port write +0x282, port read
++0x21E follow). Fix: busy reads reported 0x0C (bits 2+3), so the
+`and #4' poll saw ready at once and the fake transfer never waited;
+busy now reports 0x08 (bit 3 shifting, TX-ready clear), ready 0x04.
+The packet is binary, not text, so this channel is a protocol link
+(panel/DSP candidate), not the DBG_TxD console -- the stub stays a
+TRACE logger (CDJ_FWLOG equivalent). Packet archived untracked for
+Tasks 7/8: `extract/cdj850/ser_tx_bringup2.bin` (1140 B, sha256
+395475ef...f91196; first 00000900000030001304d03f07b49e0, last 45c8...
+0af080ff0000).
+
+Bridge note (correction to the paragraph above): the GDB `Mce4a330'
+poke applied at reset is cleared mid-boot ([0x0CE4A330] reads back 0
+at the E_SYS halt; the 0x0DDEFA20 hole holds image bytes then, not
+free space). The working bridge is the committed `CDJ_RPOKE'
+translator facility: RPOKE[0] (allocator ramp at 0x0C0D0122 into
+0x0C400000+72) is load-bearing; RPOKE[1..3] (r0=0 at 0x0C0B8DB2/
+0x0C0FF6C6/0x0C00570A) are no-ops (r0 already 0 at first hit) kept as
+guards. MAIN is not verbatim in flash (main region entropy 7.69 =
+compressed; strings like `freeWorkComm' exist only in SDRAM), so all
+firmware forensics below are against live `xp`/memsave bytes, with
+Capstone-BE (QEMU `x/i` mis-decodes SH-2A; Capstone 5.0.7 itself
+misses some SH-2A 32-bit forms -- trust `in_asm`, not Capstone,
+for what executed).
+
