@@ -57,3 +57,17 @@ def test_c850_dsp_decode_synthetic():
         recs.append((0x0C0FCA02, 6811, PEIORL, 2, 0xF1C0))
         recs.append((0x0C0FC918, 6811, PEDRL, 2, 0x50C0))
     assert decode_image(recs) == bytes(expected) == b"\x3c\x07\xa5"
+
+
+def test_c850_unpack_map():
+    # Packed-MAIN -> SDRAM decoder map (Task 8d): unpack the prepared
+    # main_flat.bin and pin length + SHA (reads the local extract only,
+    # never the read-only UPD; byte-matches live SDRAM code/rodata).
+    import pathlib
+    from c850_unpack import UNPACK_LEN, UNPACK_SHA256, decode_main
+    import hashlib
+    flat = pathlib.Path("extract/cdj850/main_flat.bin")
+    declared, image = decode_main(str(flat))
+    assert declared == 0x19E6E6
+    assert len(image) == UNPACK_LEN == 0x39231E
+    assert hashlib.sha256(image).hexdigest() == UNPACK_SHA256
