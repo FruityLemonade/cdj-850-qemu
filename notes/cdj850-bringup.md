@@ -707,3 +707,47 @@ byte `((H<<1|1)<<4)|(L<<1|1)`.
   static-8 already exhausts the single-decisive-byte bound.
   Stopping per honesty gate; hardware capture (reply
   timing/sequence + DSPDREQ pulse behavior) replaces the knob.
+
+## Task 8h: PE12-pulse-at-sampler micro-experiment — NOTHING (honest negative; 2026-10-14)
+
+Full report:
+.superpowers/sdd/2026-10-12-cdj850-support/task-8h-report.md.
+EB `~/qemu-build-eb/qemu-system-sh4eb` (rebuilt twice; warning-free
+apart from the pre-existing `ld: -undefined error` notice), BASE
+`e2f751c`. No subagents. No bridge. Firmware read-only; run/probe
+scripts in /tmp only (uncommitted); no new extract files.
+
+- Basis, diff-quoted (8g reviewer finding): DSP56371 UM Rev 2.1
+  Table 2-7 HREQ ("When configured for the slave mode, HREQ is
+  asserted to indicate that the SHI is ready for the next data word
+  transfer and deasserted at the first clock pulse of the new data
+  word transfer.") + UM §7.7.1 "SPI Slave Mode" (p. 7-19: "HREQ is
+  deasserted at the first clock pulse of the next data word
+  transfer.") + f70e4d.pdf §10.14 p. 91 panel 5 (IC103 pin 72
+  DSPDREQ, 1.0 V/div, 20 us/div: trace idles HIGH with a brief LOW
+  pulse per transaction). Same quotes live in `dsp56371.c`.
+- Knob: `CDJ850_DSP_PULSE=1` (default OFF; composes with
+  `CDJ850_DSP_REPLY`): PE12 LOW only at the sampler phase reads,
+  HIGH elsewhere; PE6/PE8 never cleared. Self-caught off-by-two:
+  phase 1's executing load is the `mov.w @(r0,r11),r5` at
+  `0x0C0FC922`, not the `mov r14,r0` setup at `0x0C0FC920` named in
+  8g (first pulse-only boot assembled 0x10 = ph1 nibble 1 = PE12
+  HIGH at the true read, exposing the miss); 8g reply behavior is
+  byte-identical before/after (its default-H branch already covered
+  the true ph1 read).
+- Live proof: RSP reads at stopped sampler PCs show PE12=0/PE8=1
+  (both phases); hot gate `0x0C0FC704` + `0x0C0FC24C` show
+  PE6=PE8=PE12=1 (no leak; gates keep passing). (Validator-body
+  gate `0x0C0FC736` + xfer gate `0x0C0FCBB0` are cold — 60 s
+  no-hit, consistent with 8g depth-zero, not a hang.)
+- 2 verdict boots (40 s): pulse-only → sample 0x00, flags all 0;
+  pulse+0x77 → sample 0xEE (predicted ((7<<1)<<4)|(7<<1)),
+  flags 00 01 01 01, `[5E]=1` (same genuine progress as 8g k77, not
+  movement). Both: `[4F]/[67]/[02]/[A6]/[AE9]` + ACCEPT
+  `[0x0CE4B8F5]` + MASK `[0x0CE49CD0]` + collector `[0x0C7F6D1C]`
+  all zero; stop PCs known park PCs (`0x0C0B8F04`, `0x0C0C682C`).
+- Verdict NOTHING: no accept/mask/collector/dispatch change vs 8g
+  baseline. Static + temporal-local space now both exhausted; the
+  only remaining path is hardware capture (per-strobe PE12-15 +
+  strobe clocks from DSPRST release, §10.14-style).
+- Suite: `test_sh2a_smoke + test_firmware_cdj850` 13 passed.

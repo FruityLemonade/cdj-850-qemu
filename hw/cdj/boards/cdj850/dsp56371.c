@@ -60,10 +60,12 @@
  *    $CDJ850_DSP_REPLY=0xHL (H,L hex digits, each 0-7) makes the model
  *    drive MAIN's PE15:13 reply-DATA lines the way the real DSPC56371
  *    PROM application would: sampler 0x0C0FC8FA assembles its reply byte
- *    at 0x0C7F6D6C from two back-to-back Port-E reads (phase 1 at guest
- *    pc=0x0C0FC920, phase 2 at pc=0x0C0FC95C; each `and #0xF000, shad
- *    #-12`, byte = (phase1<<4)|phase2). The model answers phase 1 with
- *    H and phase 2 with L (PE12/DSPDREQ stays READY=1 either way), so
+ *    at 0x0C7F6D6C from two back-to-back Port-E reads (phase 1 =
+ *    `mov.w @(r0,r11),r5` at guest pc=0x0C0FC922, phase 2 =
+ *    `mov.w @(r0,r11),r14` at pc=0x0C0FC95C; each `and #0xF000, shad
+ *    #-12`, byte = (phase1<<4)|phase2). The model answers phase 2
+ *    with L and every other Port-E read (incl. the phase-1 read)
+ *    with H (PE12/DSPDREQ stays READY=1 either way), so
  *    the assembled byte is ((H<<1|1)<<4)|(L<<1|1); all other Port-E
  *    reads see H on PE15:13 (the DSP's quiescent DATA). Unset (or any
  *    value outside 0x00-0x77) = OFF = pure loopback, byte-identical to
@@ -80,6 +82,46 @@
  *    patterns under PE12=1). Ground truth = pending hardware capture,
  *    which REPLACES these values; until then they are the
  *    validator-satisfying set, never committed as always-on behavior.
+ *
+ * 4. EXPERIMENTAL PE12 pulse (Task 8h, user-authorized, default OFF).
+ *    $CDJ850_DSP_PULSE=1 drives PE12 (DSPDREQ = DSP HREQ) LOW only
+ *    during the sampler's two phase reads (guest pcs 0x0C0FC922 /
+ *    0x0C0FC95C, the executing `mov.w @(r0,r11)` loads — see the
+ *    PH1 off-by-two note below; the same PCs the reply drive
+ *    discriminates on) and HIGH everywhere else. It composes with $CDJ850_DSP_REPLY: with
+ *    both set, the assembled sample byte is ((H<<1|0)<<4)|(L<<1|0)
+ *    (PE12=0 clears the LSB of each nibble); with pulse-only, the
+ *    loopback latch's PE15:13 stand and only the PE12 LSB is forced
+ *    to 0 at the two sampler PCs. Unset (any value but "1") = OFF =
+ *    PE12 READY=1 always (Task 8g behavior). Gate-safety: PE6/PE8
+ *    are never cleared by this path (the OR of CDJ850_DSP_PE6 /
+ *    CDJ850_DSP_PE8 is unconditional once alive), and the sampler
+ *    PCs are disjoint from the READY-gate PCs (gates 0x0C0FCA7A /
+ *    0x0C0FCBB0, validator gates 0x0C0FC736-5A `and #64` / `and
+ *    #0x100`), so the HIGH-waits keep passing; verified live (8h).
+ *    Pin-behavior basis, quoted verbatim (reviewer finding from 8g:
+ *    diff-quoted, not report-asserted):
+ *    - DSP56371 User Manual Rev 2.1, Table 2-7 (Serial Host
+ *      Interface Signals), HREQ signal description: "When
+ *      configured for the slave mode, HREQ is asserted to indicate
+ *      that the SHI is ready for the next data word transfer and
+ *      deasserted at the first clock pulse of the new data word
+ *      transfer."
+ *    - DSP56371 User Manual Rev 2.1, section 7.7.1 "SPI Slave
+ *      Mode" (p. 7-19): "The HREQ output pin, if enabled for
+ *      receive (HRQE[1:0] = 01), is asserted when the IOSR is
+ *      ready for receive and the HRX FIFO is not full; this
+ *      operation guarantees that the next received data word is
+ *      stored in the FIFO." ... "HREQ is deasserted at the first
+ *      clock pulse of the next data word transfer."
+ *    - Service manual f70e4d.pdf, section 10.14, p. 91, panel 5
+ *      (IC103 pin 72 DSPDREQ, 1.0 V/div, 20 us/div): "the trace
+ *      idles HIGH with a brief LOW pulse per transaction" (8c
+ *      rendering) - i.e. the quiescent/ready level is HIGH, and
+ *      LOW is only the momentary per-transfer assertion.
+ *    Scope bound (8h brief): one micro-experiment, at most 2
+ *    boots, verdict MOVED-or-NOTHING; no duty-cycle/timing
+ *    sweeps, no other pins.
  *
  * What this does NOT do (honest limits):
  * - No DSP56371 core executes yet: the opcode census needs a complete
@@ -114,8 +156,16 @@ typedef struct QEMU_PACKED {
 } Cdj850DspRec;
 
 /* Sampler 0x0C0FC8FA phase-read PCs (Port-E word reads whose high
- * nibble, PE15:12, becomes the reply byte at 0x0C7F6D6C). */
-#define CDJ850_SAMPLER_PH1_PC 0x0C0FC920u /* phase 1: byte bits 7:4 */
+ * nibble, PE15:12, becomes the reply byte at 0x0C7F6D6C).
+ * NOTE (Task 8h correction): phase 1's executing load is the
+ * `mov.w @(r0,r11),r5` at 0x0C0FC922, not the `mov r14,r0` setup at
+ * 0x0C0FC920 named in the 8g report (self-caught: pulse-only
+ * assembled 0x10 = ph1 nibble 1 = PE12 HIGH at the true read,
+ * proving the clear missed). The 8g reply knob is insensitive to
+ * this off-by-two: its default branch drives H on every non-PH2
+ * Port-E read, which already covered the true ph1 read, so reply
+ * behavior is byte-identical before/after the correction. */
+#define CDJ850_SAMPLER_PH1_PC 0x0C0FC922u /* phase 1: byte bits 7:4 */
 #define CDJ850_SAMPLER_PH2_PC 0x0C0FC95Cu /* phase 2: byte bits 3:0 */
 
 typedef struct {
@@ -127,6 +177,7 @@ typedef struct {
     uint64_t n_reads;
     int reply_hi;       /* -1 = OFF (loopback); else 0-7, phase-1 PE15:13 */
     int reply_lo;       /* -1 = OFF (loopback); else 0-7, phase-2 PE15:13 */
+    bool pulse_pe12;    /* Task 8h: PE12 LOW only at sampler phase reads */
 } Cdj850Dsp;
 
 static Cdj850Dsp cdj850_dsp;
@@ -134,6 +185,7 @@ static Cdj850Dsp cdj850_dsp;
 void cdj850_dsp_init(void)
 {
     const char *rep;
+    const char *pulse;
 
     memset(&cdj850_dsp, 0, sizeof(cdj850_dsp));
     cdj850_dsp.reply_hi = -1;
@@ -157,6 +209,19 @@ void cdj850_dsp_init(void)
             info_report("cdj850: dsp reply: ignoring bad CDJ850_DSP_REPLY "
                         "'%s' (want 0x00-0x77), OFF", rep);
         }
+    }
+    /* Experimental PE12 pulse (Task 8h): $CDJ850_DSP_PULSE=1 drives
+     * PE12 LOW only at the sampler phase reads, HIGH elsewhere.
+     * Default OFF. Parsed once; any other value = OFF (no warn: the
+     * unset case is the normal path). */
+    pulse = getenv("CDJ850_DSP_PULSE");
+    if (pulse && strcmp(pulse, "1") == 0) {
+        cdj850_dsp.pulse_pe12 = true;
+        info_report("cdj850: dsp pulse: EXPERIMENTAL PE12 pulse ON "
+                    "(CDJ850_DSP_PULSE=1: PE12 LOW only at sampler "
+                    "pcs 0x0C0FC922/0x0C0FC95C, HIGH elsewhere; "
+                    "PE6/PE8 READY untouched; hardware capture "
+                    "replaces this)");
     }
 }
 
@@ -242,14 +307,27 @@ uint64_t cdj850_dsp_adjust_read(hwaddr off, unsigned size, uint64_t v,
         return v;
     }
     cdj850_dsp.n_reads++;
-    /* OR the DSP-driven READY levels over PEDRL-overlapping bytes. */
+    /* OR the DSP-driven READY levels over PEDRL-overlapping bytes.
+     * Task 8h pulse: at the two sampler phase-read PCs with
+     * CDJ850_DSP_PULSE=1, PE12 is driven LOW (cleared) while PE8
+     * stays HIGH; everywhere else PE12 stays READY=1. PE6 (low
+     * byte) is never touched by either path. */
     for (i = 0; i < size; i++) {
         hwaddr a = off + i;
 
         if (a == CDJ850_PEDRL_OFF) {
             /* High byte: PE8 (bit0 of byte) + PE12 (bit4 of byte). */
-            v |= (uint64_t)(CDJ850_DSP_PE8 | CDJ850_DSP_PE12) >>
-                 8 << ((size - 1 - i) * 8);
+            unsigned shift = (size - 1 - i) * 8;
+
+            if (cdj850_dsp.pulse_pe12 &&
+                (pc == CDJ850_SAMPLER_PH1_PC ||
+                 pc == CDJ850_SAMPLER_PH2_PC)) {
+                v |= (uint64_t)(CDJ850_DSP_PE8 >> 8) << shift;
+                v &= ~((uint64_t)((CDJ850_DSP_PE12 >> 8) & 0xFF) << shift);
+            } else {
+                v |= (uint64_t)(CDJ850_DSP_PE8 | CDJ850_DSP_PE12) >>
+                     8 << shift;
+            }
         } else if (a == CDJ850_PEDRL_OFF + 1) {
             /* Low byte: PE6. */
             v |= (uint64_t)CDJ850_DSP_PE6 << ((size - 1 - i) * 8);
