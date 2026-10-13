@@ -353,3 +353,66 @@ corrections to the park paragraph above (signed off via live-xp GDB +
   Task 8's DSP/panel upload populating these tables. Do NOT paper over
   with stub fabrications. No commit (Step 4: no code changed); suite
   untouched (baseline).
+
+## Task 6e increment 1: panel-handshake ready pin 0xFFFE391E + xc split (2026-10-13)
+
+Step 1 correction first: Task 6d's "park polling repeated 0x01c40 reads"
+was imprecise. The 0x01c40 reads are USB INTSTS0 (offset 0x40 of the
+0xFFFC1C00 block), BOUNDED (12x, then boot moves on to the 0x2801x block).
+The true infinite park is a SILENT port poll at 0x0C08E8F2, invisible in
+the unimp log because the port block is modelled storage.
+
+- Full device address: r0 = 0xFFFE391E (movi20 #0xE391E sign-extends),
+  r11 = 0; `mov.w @(r0,r11),r6` reads the word, waits for bit 2
+  (extu.w; shar; shar; bld #0,r2; bf loop). Live QMP: pc stable at
+  0x0C08E8F2/0x0C08E8F4 over 3 samples/6 s, r0 = 0xFFFE391E, r11 = 0.
+  CDJ850_TRACE: `port read +0x11e size 2 = 0x0 at pc=0x0c08e8f2` from
+  1587 ms on; +0x11E never written (only +0x110..+0x116 pin-function
+  neighbours), so stored zero never releases it.
+- Expected pattern: bit 2 = 1 (peer ready/idle). Driver 0x0C08E8AE
+  (device id 1; sibling 0x0C08E842 for id 0 never runs this boot):
+  int-disable, 0xAA/0x55 probe patterns to void 0x20000xxx scratch,
+  SR restore, delay, ACK-wait, outcome to SDRAM 0x0CEE34AA + flag.
+  Called from the mode-2 branch of the boot dispatcher (state
+  [[0x0C08EC28]] == 2).
+- Hardware: panel-handshake GPIO. The 0xFFFC1C00 block is the on-chip
+  R8A66597-family USB (offsets match hw/cdj/common/usb_r8a66597.h
+  exactly: SYSCFG 0x00/SYSSTS0 0x04/DVSTCTR0 0x08/INTENB0 0x30/INTENB1
+  0x32/BRDYENB 0x36/NRDYENB 0x38/BEMPENB 0x3A/INTSTS0 0x40/PIPESEL
+  0x64/PIPECFG 0x68/PIPEBUF 0x6A/PIPEMAXP 0x6C/PIPECTR5 0x78; INTENB1
+  0x4030 arms BCHG + control-transfer interrupts; firmware strings
+  usbh_msc/usbTask/USB-A-host + USB-B-function confirm both stacks).
+  The service manual's signal block diagram wires MAIN (IC103) to the
+  panel CPU (IC1007) over TSI/TSO/TSCK serial plus PNL_XBUSY/MAIN_XBUSY
+  handshake GPIOs (connector CN2003) — the ACK-wait shape fits, with
+  USB_CDETFLG/VBUSON and DSP-READY as noted alternates. Exact SH7263 pin
+  name for +0x11E unchecked (no hardware manual on file).
+- Model (xc/port.c): reads of +0x11F (low byte of the +0x11E word;
+  self-caught off-by-one — strapping +0x11E reads back 0x0400, which the
+  shar-shar-bld sequence still sees as 0) OR in bit 2, storage otherwise.
+  The level is what the driver's own comparison dictates (same always-
+  ready rationale as the mbox stub); no data bytes invented; the panel
+  protocol stays Task 7's.
+- File-split rule applied: port/ser/mbox move to xc/ (xc/port.c,
+  xc/ser.c, xc/mbox.c + headers, shared xc/trace.h); board.c keeps
+  intc/ccr/ccn-audit; meson updated. Verbatim moves except the pin bit.
+- Evidence: rebuild warning-free (only the pre-existing ld notice);
+  boot passes the handshake (`port read +0x11e = 0x4` exit at 1482 ms),
+  runs ser-upload (1143 TX bytes via 0xFFFE7000), mbox 0x90102 rounds,
+  INTC IPR programming, CMT restart — unimp counts unchanged 82w+46r
+  (no new unmodelled touches). Suite 659 passed / 38 skipped / 1 xfailed.
+
+Next wall (NOT a fault, NOT a translator gap — a silent peer-event
+park, this task BLOCKED here): outer loop 0x0C0B8EAE spins while the
+scan 0x0C0B8ED8 returns mask 0 over 17 pool-2 object slots (bytes
+0x0CE49CBC = 00 00 03..0E 00 00 00, words 0x01010101.., ptrs to OCRAM
+TCBs; release needs [*ptr+20] to differ from word for a claimed entry).
+Hard park (60 s run never leaves; pc histogram only scan + CMT-tick
+ISR 0x0C0C68FC). -d exec proves the RTOS is alive: usbTask creator
+(0x0C10B34A), usbh_msc (0x0C01DAFC+), servoTask entry (0x0C0FF8C8, name
+confirmed in SDRAM strings), ser TX driver, tick ISR all execute, then
+everyone blocks on peer/device events that never arrive (no panel/DSP/
+USB peers; our ser/mbox stubs raise no RX/IRQ). What unblocks it needs
+a Task 7/8 call: panel-serial RX bytes? DSP/mbox reply IRQ? servo
+"no disc"? SH7263 manual (INTC IPR +0x40E source at 1477 ms, USB
+vectors) required before any IRQ wiring — do not guess vectors.
