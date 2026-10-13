@@ -237,3 +237,52 @@ For Task 7 (panel): ser packet above + PFC 0xFFFE0414 RMW + CPG
 mirrors 0x0CEE33D0/0x0CEE33D4/0x0CEE3160/0x0CEE34C1, validators
 0x0C075E40/0x0C076006/0x0C0CF4C4/0x0C0C688A/0x0C0C6894, data
 0x0C155AAC, DMA DAR_1/2 hooked to mbox+8 (+0xFFFFC008/+0xFFFFC808).
+
+## Task 6b: wild-RTS forensics — Exit B, NOT a wild RTS (2026-10-13)
+
+Reproduced identically (bridge+RPOKE, 20 s): 30w+9r, pc=0x000002F8
+(`bra self` + nop), CMT vector 188 pending, IMASK=14. Full report:
+.superpowers/sdd/2026-10-12-cdj850-support/task-6b-report.md. Headline
+corrections to the park paragraph above (signed off via live-xp GDB +
+`-d exec,in_asm`, in_asm authoritative, scripts in /tmp t6b_*.py):
+
+- The `rts` at 0x0C0B91D6 fires TWICE. First (boot, pr=0x0C000008,
+  sp=0xFFF90000) returns CORRECTLY into the MAIN init-call chain at
+  0x0C000000 (`mov.l @PC,Rn; jsr/n @Rn` trampolines, SH-2A JSR/N=0x4n4B;
+  literals 0x0C0B92AC/8FF4/951C; ends `bra self` at 0x0C00000C) and runs
+  the 0x0C0B951C->0x0C0C64B0 cascade. The port function itself
+  (0x0C0B91C0-D8, port polls + RAM stores, delay-slot store) never
+  writes pr: it is clean in both passes.
+- The fault is the SECOND pass: the 0x0C0C68xx driver epilogue
+  (FPU restore 0x0C0C6806, GBR/MACH/MACL restore + `rte` 0x0C0C682C)
+  resumes a task context with pc=0x0C0B931C (boot-time code area, by
+  then overwritten with runtime descriptor tables referencing
+  RPOKE-scratch 0x0C400AAF/AB0/1B0 + pool arena 0x0CE4A30C),
+  pr=0x0C0C78D8 (more table-data), sp=0x0C400A53 (inside RPOKE
+  scratch). Pre-history in the same exec flow: allocator 0x0C0D01xx
+  (brackets the RPOKE site 0x0C0D0122, 3 alloc iterations at 0x0C0D01C4).
+- The resumed thread runs descriptor bytes: a 2-insn oscillation at
+  0x0C0B931C/1E (~86k TB execs, ZERO stub/MMIO accesses in the span —
+  same-run exec+TRACE correlation) with `sts.l pr,@-r15` descending
+  from scratch, then falls into the port driver (works: r6=0x1000 or
+  0x0 across runs, same outcome), `rts` to 0x0C0C78D8, executes table
+  bytes (`mov #-93,r4`; BSC read 0xFFFC750C=0; `shlr r0` -> 0x7FFF1D43;
+  `bsr 0x0C0C78FE`, pr=0x0C0C78E6) and dies on the delay-slot word
+  0x0C68 (an SH-2A form both disassemblers print as `.word`; no handler
+  TB executes) -> flash halt 0x000002F8. [VBR+0x100]=0x0C0C68FC (never
+  runs at fault), [VBR+0xA00]=0.
+- Stub-independence (why no board.c change): (a) zero stub MMIO in the
+  86k span; (b) the faulting indexed access (base 0x7FFF1D43 + 16-bit
+  index) can never reach a valid mapping for ANY index value;
+  (c) r6 varies run to run (0x0/0x1000), outcome identical;
+  (d) mailbox-not-ready would park EARLIER (validation 0x0C075ECA).
+  The DMA-driver-text hypothesis is out too (CHCR=0x1810 DE=0, path
+  never touches 0x0C1C14E0).
+- Verdict: Exit B. The resumed context is a creature of the RPOKE
+  bridge (built by allocator flow through the ramp site, stack inside
+  ramped scratch) and/or of peer-starved tables (mailbox echo consumed
+  as DSP data). Owned elsewhere: genuine pool-2 init to replace the
+  ramp (Task 6 remainder — the [0x0CE4A330] WHY is still open), and/or
+  Task 8's DSP/panel upload populating these tables. Do NOT paper over
+  with stub fabrications. No commit (Step 4: no code changed); suite
+  untouched (baseline).
