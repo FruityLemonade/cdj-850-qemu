@@ -2,11 +2,11 @@
 #include "cdj_common.h"
 #include "xc/adc.h"
 #include "xc/cmt.h"
-#include "xc/mbox.h"
 #include "xc/panel_link.h"
 #include "xc/port.h"
 #include "xc/scif.h"
 #include "xc/ser.h"
+#include "xc/ssi.h"
 #include "xc/vfd.h"
 /*
  * Pioneer CDJ-850 MAIN board (Renesas SH7263, SH-2A) -- bring-up.
@@ -441,7 +441,7 @@ static void cdj850_init(MachineState *machine)
     cdj850_port_init(sysmem, cpu);
     cdj850_ser_init(sysmem, cpu);
     cdj850_scif_init(sysmem, cpu);
-    cdj850_mbox_init(sysmem, cpu);
+    cdj850_ssi_init(sysmem, cpu);
     cdj850_cmt_init(sysmem, cpu);
     /* Audit the silent SH-4 CCN mapping (see the device comment). */
     cdj850_ccnaudit_init(sysmem, cpu);
