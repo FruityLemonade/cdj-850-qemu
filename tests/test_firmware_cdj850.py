@@ -71,3 +71,118 @@ def test_c850_unpack_map():
     assert declared == 0x19E6E6
     assert len(image) == UNPACK_LEN == 0x39231E
     assert hashlib.sha256(image).hexdigest() == UNPACK_SHA256
+
+
+def test_c850_shi_helpers_synthetic():
+    # Synthetic vectors only (never firmware bytes): a well-formed SHI
+    # header (count=3, addr=0, JMP vector table + NOP/RTS/REP payload)
+    # must pass every stage; a garbage buffer must fail each one.
+    from c850_shi_search import (census, exact_fit_offsets, find_all,
+                                 framing_at, scan_headers, vector_ok,
+                                 words24)
+    good = (bytes([0, 0, 16, 0, 0, 0])          # count=16 addr=0
+            + bytes([0x0C, 0x00, 0x10,           # JMP-short $010
+                     0x00, 0x00, 0x00,           # NOP (slot 1)
+                     0x0C, 0x00, 0x20,           # JMP-short $020
+                     0x00, 0x00, 0x00,           # NOP
+                     0x0C, 0x00, 0x30,           # JMP-short $030
+                     0x00, 0x00, 0x00,           # NOP
+                     0x0C, 0x00, 0x40,           # JMP-short $040
+                     0x00, 0x00, 0x00,           # NOP
+                     0x0C, 0x00, 0x50,           # JMP-short $050
+                     0x00, 0x00, 0x00,           # NOP
+                     0x0C, 0x00, 0x60,           # JMP-short $060
+                     0x00, 0x00, 0x00,           # NOP
+                     0x0C, 0x00, 0x70,           # JMP-short $070
+                     0x00, 0x00, 0x0C,           # RTS
+                     0x00, 0x00, 0x00,           # NOP
+                     0x00, 0x00, 0x00]))         # NOP
+    assert framing_at(good, 0, "BE") == (16, 0)
+    assert (0, "BE", 16) in exact_fit_offsets(good)
+    payload = words24(good[6:], "BE")
+    assert vector_ok(payload)
+    marks = census(payload)
+    assert marks["nop"] == 8 and marks["jmp"] == 7 and marks["rts"] == 1
+    assert scan_headers(good) == [(0, "BE", 16, 0)]
+    assert find_all(b"ababa", b"aba") == [0, 2]
+    bad = bytes([0x8B, 0xA0, 0x8C, 0x80, 0x90, 0x0D, 0x91, 0x88,
+                 0xFF, 0xFF, 0xFF, 0xFF])
+    assert framing_at(bad, 0, "BE")[0] != 2  # huge count, not remaining
+    assert exact_fit_offsets(bad) == []
+    assert not vector_ok(words24(bad, "BE"))
+    assert scan_headers(bad) == []
+
+
+def test_c850_shi_init_image_misfit():
+    # Task 8e: the recorded 519-B image (local extract, SHA-pinned) owns
+    # no SHI framing (UM App. A) and no DSP563xx code markers in either
+    # byte order — mode 5 notwithstanding, nothing carves from it.
+    import hashlib
+    import pathlib
+    from c850_shi_search import (IMAGE_LEN, IMAGE_SHA256, census,
+                                 exact_fit_offsets, framing_at, words24)
+    img = pathlib.Path("extract/cdj850/dsp_init_image.bin").read_bytes()
+    assert len(img) == IMAGE_LEN == 519
+    assert hashlib.sha256(img).hexdigest() == IMAGE_SHA256
+    assert len(img) // 3 == 173
+    for order in ("BE", "LE"):
+        count, addr = framing_at(img, 0, order)
+        assert (count, addr) != (171, addr) or addr >= 0x1000
+        assert count != 171  # offset-0 count must be 171 (0xAB) to fit
+        marks = census(words24(img, order))
+        assert marks["nop"] == 0 and marks["rts"] == 0
+        assert marks["rep"] == 0 and marks["bra_short"] == 0
+    assert exact_fit_offsets(img) == []  # no offset fits count+address
+
+
+def test_c850_shi_negative_search():
+    # Rigorous redo: full-length bytes.find of the 519-B image over the
+    # packed AND unpacked MAIN finds nothing (all offsets, not first-hit).
+    import pathlib
+    from c850_shi_search import IMAGE_SHA256, find_all
+    from c850_unpack import UNPACK_SHA256, decode_main
+    import hashlib
+    img = pathlib.Path("extract/cdj850/dsp_init_image.bin").read_bytes()
+    assert hashlib.sha256(img).hexdigest() == IMAGE_SHA256
+    packed = pathlib.Path("extract/cdj850/main_flat.bin").read_bytes()
+    _declared, unpacked = decode_main("extract/cdj850/main_flat.bin")
+    assert hashlib.sha256(unpacked).hexdigest() == UNPACK_SHA256
+    assert find_all(packed, img) == []
+    assert find_all(unpacked, img) == []
+
+
+def test_c850_shi_header_scan_pins():
+    # Header-scan class pins on the verified unpacked image: structural
+    # candidates exist (SH code/table aliasing) but none is a genuine
+    # program — no survivor combines a distinct-handler vector table
+    # with subroutine structure (RTS), a valid REP loop, and a nonzero
+    # reset jump. Representatives of every survivor class disassemble
+    # as valid SH-2A (see Task 8e report); the packed image's single
+    # vector survivor is LZSS-stream coincidence (census-rejected).
+    from c850_unpack import decode_main
+    from c850_shi_search import (JMP_HI, VECTOR_SLOTS, scan_headers,
+                                 vector_ok, words24)
+    _declared, unpacked = decode_main("extract/cdj850/main_flat.bin")
+    cands = scan_headers(bytes(unpacked))
+    assert len(cands) == 4816
+    vec = [c for c in cands
+           if vector_ok(words24(unpacked[c[0] + 6:c[0] + 42], c[1]))]
+    assert len(vec) == 253
+
+    def genuine(off, order, cnt):
+        payload = words24(unpacked[off + 6:off + 6 + 3 * cnt], order)
+        slots = [payload[s] for s in VECTOR_SLOTS if s < len(payload)]
+        targets = set(w & 0xFFF for w in slots if (w >> 16) in JMP_HI)
+        rts = payload.count(0x00000C)
+        rep = sum(1 for w in payload
+                  if (w >> 16) == 0x06 and (w & 0xF0) == 0xA0)
+        reset = ((payload[0] >> 16) in JMP_HI and (payload[0] & 0xFFF) != 0)
+        return len(targets) >= 4 and rts >= 1 and rep >= 1 and reset
+
+    assert not any(genuine(off, order, cnt) for off, order, cnt, _ in vec)
+    packed = open("extract/cdj850/main_flat.bin", "rb").read()
+    pcands = scan_headers(packed)
+    assert len(pcands) == 88
+    pvec = [c for c in pcands
+            if vector_ok(words24(packed[c[0] + 6:c[0] + 42], c[1]))]
+    assert len(pvec) == 1  # LZSS-stream coincidence (census-rejected)
