@@ -53,6 +53,13 @@
 #define PANEL_TX_RING 4096
 
 /* Idle reply frame for the 6-byte status exchange, per the parse above. */
+/* TODO(Task 8/9-a): DjControl accept-path stores (0x0C7F663C flag, 0x0C7F65BC
+ * dst) read zero despite the gate at 0x0C014822 passing -- either a different
+ * live reader among the 6 buffer refs or per-cycle clearing. Task 8 should
+ * watch the store writers; park-equivalent here (periodic poll, no wedge). */
+/* TODO(Task 9-b): RX-buffer tail byte 0x13 (byte 7) sits beyond consumed
+ * [0..5] -- readers only consume [0..5]; if a longer frame exists it is
+ * unmapped. Task 9 inherits the tail-byte question with key/FL mapping. */
 static const uint8_t panel_idle_frame[6] =
     { 0x00, 0x00, 0x00, 0x01, 0x01, 0x01 };
 

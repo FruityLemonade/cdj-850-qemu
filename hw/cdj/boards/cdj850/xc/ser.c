@@ -47,8 +47,9 @@ typedef struct {
 
 #define CDJ850_SER_BUSY_READS 16
 /* Status bits on +4 (SSSR): bit 1 = RX-full (RDRF), bit 2 = TX-ready
- * (TDRE, polled), bit 3 = transfer progress (the TEND slot: set while a
- * transfer runs, clear when it drains -- the shape both BLD #3 wait loops
+ * (TDRE, polled), bit 3 = TEND (Transmit End per SSSR Table 16.3.5, not BS;
+ * transfer progress: set while a transfer runs, clear when it drains -- the
+ * shape both BLD #3 wait loops
  * require), bit 6 = overrun (ORER). Busy reports bit 3 WITHOUT bit 2, so
  * the firmware's `and #4' poll genuinely waits out the fake transfer
  * instead of seeing ready at once. */
@@ -132,7 +133,10 @@ static void cdj850_ser_write(void *opaque, hwaddr off, uint64_t val,
         }
         if (a == 3 && !was_re && (s->reg[3] & CDJ850_SER_RE)) {
             /* Exchange start (SSER RE set): the panel reply frame
-             * restarts at byte 0. */
+             * restarts at byte 0.
+             * TODO(Task 8/9): RE-toggle cadence wasn't single-stepped --
+             * alignment-consistent with observed RX order 00 00 00 01 01 01
+             * but unverified; Task 8 should confirm frame-restart timing. */
             panel_exchange_start();
         }
     }
