@@ -128,3 +128,46 @@ DSP56300FM ch. 13 (NOP `$000000`, RTS `$00000C`, REP `$06xxxx`
   next task: the observed 519 B is phase-1 control fill; the program
   upload, if any, is gated behind the never-completing reply
   handshake, or assembled purely from scattered immediates).
+
+## SPI-bitstream re-decode (Task 8i, offline NOT-SPI 2026-10-13)
+
+Tool: `scripts/firmware/c850_spi_decode.py` (GPL + tests
+`test_c850_spi_*`; reuses `c850_shi_search` framing/census, not
+duplicated). Record: existing `/tmp/8c-record20.bin` (91834 entries,
+ms 6057-24653, 75465 PEDRL + 16369 PEIORL; file order is ms-sorted;
+no re-record, no boots, no board-code changes).
+
+- Clock/data assignment (unpacked MAIN, SH-2A BE; record PCs are
+  QEMU `env.pc`, +2 past delay-slot writes): PE6 gate reads
+  (`0x0C0FC73E` + `and #64`; siblings `CA86/BB0/CD8C/CE5E`),
+  PE8 gate reads (`0x0C0FC752` + `and r4,r2`, r4 = 0x0100 via
+  `shll8` at `0x0C0FC74C`), sampler nibble reads (ph1 `0x0C0FC922`
+  + `and 0xF000` at `0x0C0FC92E` + `shad #-12`; ph2 `0x0C0FC95C` /
+  `0x0C0FC968`). Exhaustive `0x0C0FC600-0x0C0FD400` scan: only
+  `and #64` / 0x0100 / 0xF000 touch Port-E; `bset/bclr` only #6;
+  `and #240/#15` are byte/nibble merges; `bld` samples SDRAM flags
+  (`0x0C0FCA44` bit 7 of `0x0C7F6D6C`). No PE9/PE12/PE14 isolate
+  exists — the hypothesis's sampling claim does not match the code.
+  Delays via `0x0C107932` (r4 = count; e.g. `0x0C0FC91C` r4 = 1,
+  `0x0C0FCA0A` r4 = 80) are nibble-paced; guards
+  `0x0C0C688A/94` bracket Port-E. PEIORL `0x0C0FCDEA=0xF1C0`
+  (outputs) / `0x0C0FCDF0=0x01C0` (inputs) toggles the whole
+  nibble — parallel GPIO, not fixed-direction SPI.
+- Bitstream (SCK = PE8 0->1 rises; data = PE12/13/14/15 serially
+  plus nibble-parallel both MSB orders; MSB-first per UM §7.4):
+  full = 25030 rises; upload (through last byte-send) = 5174 PEDRL,
+  1600 rises (558 strobe/sampler hi=5 + 1038 byte-send), 375 PE6
+  rises. Serial upload streams = 200/129/46 B; nibble upload =
+  800 B (all) / 519 B (byte-only).
+- Framing (both orders, exact-fit at every offset): ALL streams
+  `fits == []`; offset-0 counts are megabytes (never 171/199/...);
+  census 0-4 isolated singletons (nibble all-rises 7-8) — noise.
+  Nibble byte-only 15-12 reproduces the pinned 519-B image
+  byte-identically (SHA `7132eb44…3972064`, 173/173 distinct, zero
+  markers) — the "bitstream" collapses to the rejected control
+  image. Full-record nibble = 12515 B, 93.6% `0x11` (23476/25030
+  rises are nibble-1; endless reply-spin `0x1080/0x1180/0x11C0`
+  idle); head = strobe `0x55` + data burst, tail = all `0x11`.
+- Verdict NOT-SPI: periodic/control-patterned, no program words
+  (no vectors/branches/repeats, no PRAM-range count+address),
+  nothing carved; core decision stays blocked.

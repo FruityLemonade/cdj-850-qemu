@@ -751,3 +751,37 @@ scripts in /tmp only (uncommitted); no new extract files.
   only remaining path is hardware capture (per-strobe PE12-15 +
   strobe clocks from DSPRST release, §10.14-style).
 - Suite: `test_sh2a_smoke + test_firmware_cdj850` 13 passed.
+
+## Task 8i: SPI-bitstream re-decode — NOT-SPI (offline; 2026-10-13)
+
+Full report:
+.superpowers/sdd/2026-10-12-cdj850-support/task-8i-report.md.
+Branch `cdj850-bringup`, BASE `03becd1`. No subagents. No board-code
+changes, no rebuilds, no boots (offline analysis of the existing
+`/tmp/8c-record20.bin`; re-record not needed — files present).
+Firmware read-only; no new extract files.
+
+- Clock/data assignment (unpacked MAIN, SH-2A BE; record PCs +2 past
+  delay-slot writes): PE6 reads (`0x0C0FC73E` + `and #64`, siblings
+  `CA86/BB0/CD8C/CE5E`), PE8 reads (`0x0C0FC752` + `and r4=0x0100`
+  via `shll8` at `0x0C0FC74C`), sampler nibble (ph1 `0x0C0FC922` +
+  `and 0xF000` at `0x0C0FC92E` + `shad #-12`; ph2 `0x0C0FC95C`).
+  Exhaustive scan: only #64/0x0100/0xF000 touch Port-E;
+  `bset/bclr` only #6; no PE9/PE12/PE14 isolate exists. Delays via
+  `0x0C107932` (r4 = count) are nibble-paced; PEIORL
+  `0x0C0FCDEA=0xF1C0`/`0x0C0FCDF0=0x01C0` toggles the whole nibble
+  (parallel GPIO, not SPI).
+- Bitstream (PE8 0->1 rises; PE12-15 serially + nibble-parallel both
+  MSB orders; MSB-first): full 25030 rises; upload 5174 PEDRL / 1600
+  rises / 375 PE6 rises. Serial upload 200/129/46 B; nibble 800/519 B.
+- Framing (both orders, exact-fit every offset): all `fits == []`;
+  census 0-4 singletons (noise). Nibble byte-only 15-12 reproduces
+  the 519-B image byte-identically (SHA `7132eb44…3972064`) — the
+  bitstream collapses to the rejected control image. Full-record
+  nibble 12515 B is 93.6% `0x11` idle (reply-spin); head strobe
+  `0x55` + burst, tail all `0x11`. Characterization: periodic /
+  control-patterned, not program words. Nothing carved; core blocked.
+- Tool: `scripts/firmware/c850_spi_decode.py` (reuses
+  `c850_shi_search`, GPL-2.0-or-later + SPDX) + tests
+  `test_c850_spi_synthetic` / `test_c850_spi_record_pins` (11 passed
+  in `test_firmware_cdj850.py`; 63 passed smoke + firmware subset).

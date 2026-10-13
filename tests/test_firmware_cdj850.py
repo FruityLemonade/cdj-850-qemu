@@ -186,3 +186,94 @@ def test_c850_shi_header_scan_pins():
     pvec = [c for c in pcands
             if vector_ok(words24(packed[c[0] + 6:c[0] + 42], c[1]))]
     assert len(pvec) == 1  # LZSS-stream coincidence (census-rejected)
+
+
+def test_c850_spi_synthetic():
+    # Synthetic vectors only (never firmware bytes): PE8 rising edges
+    # sample one data bit per clock, MSB-first. Pattern 10100101 must
+    # assemble to 0xA5 on PE15 and to 0x00 on PE12 (which stays 0).
+    from c850_spi_decode import (bits_to_bytes_msb, nibble_bits, rise_bits)
+    ped = [(0x0C0FCC86, 6811, 0x01C0)]  # anchor, PE8=1 (not a rise source)
+    for bit in (1, 0, 1, 0, 0, 1, 0, 1):
+        setup = (0x8080 if bit else 0x0080)
+        strobe = setup | 0x0100
+        ped.append((0x0C0FCC86, 6811, setup))    # PE8=0
+        ped.append((0x0C0FCCB2, 6811, strobe))   # PE8=1 rising edge
+    assert rise_bits(ped, 8, 15) == [1, 0, 1, 0, 0, 1, 0, 1]
+    assert bits_to_bytes_msb(rise_bits(ped, 8, 15)) == b"\xa5"
+    assert bits_to_bytes_msb(rise_bits(ped, 8, 12)) == b"\x00"
+    # Nibble-parallel: nibbles 0x8 (1000) then 0xB (1011) in 15-12
+    # order must give bits 1,0,0,0,1,0,1,1 = 0x8B.
+    ped2 = [(0x0C0FCC86, 6811, 0x01C0)]
+    for hi in (0x8, 0xB):
+        base = (hi << 12) | 0x0080
+        ped2.append((0x0C0FCC86, 6811, base))
+        ped2.append((0x0C0FCCB2, 6811, base | 0x0100))
+    assert nibble_bits(ped2, (15, 14, 13, 12)) == [1, 0, 0, 0, 1, 0, 1, 1]
+    assert bits_to_bytes_msb(nibble_bits(ped2, (15, 14, 13, 12))) == b"\x8b"
+    # A single garbage byte owns no SHI framing (too short for a header).
+    from c850_shi_search import exact_fit_offsets
+    assert exact_fit_offsets(b"\xa5") == []
+
+
+def test_c850_spi_record_pins():
+    # Pins on the existing Task 8c record (/tmp, untracked): total PEDRL,
+    # PE8-rise counts, upload window, and the nibble-collapse proof.
+    # Skips when the record file is absent (re-record env in 8c notes).
+    import hashlib
+    import pathlib
+    import pytest
+    rec = pathlib.Path("/tmp/8c-record20.bin")
+    if not rec.is_file():
+        pytest.skip("no DSP record file (see Task 8c notes for re-record env)")
+    from c850_shi_search import IMAGE_SHA256, census, exact_fit_offsets, words24
+    from c850_spi_decode import (DATA_BITS, NIBBLE_MSB_ORDERS,
+                                 analyze_stream, bits_to_bytes_msb,
+                                 nibble_bits, read_pedrl, rise_bits,
+                                 upload_window)
+    ped = read_pedrl(str(rec))
+    assert len(ped) == 75465
+    assert all(ped[i][1] <= ped[i + 1][1] for i in range(len(ped) - 1))
+    n_full = sum(1 for i in range(1, len(ped))
+                 if ((ped[i - 1][2] >> 8) & 1) == 0
+                 and ((ped[i][2] >> 8) & 1) == 1)
+    assert n_full == 25030
+    up = upload_window(ped)
+    assert len(up) == 5174
+    n_up = sum(1 for i in range(1, len(up))
+               if ((up[i - 1][2] >> 8) & 1) == 0
+               and ((up[i][2] >> 8) & 1) == 1)
+    assert n_up == 1600
+    # Nibble-parallel byte-only 15-12 collapses to the pinned 519-B
+    # control image (Task 8c/8e SHA): the "bitstream" adds nothing new.
+    nib = bits_to_bytes_msb(
+        nibble_bits(up, NIBBLE_MSB_ORDERS["15-12"], byte_only=True))
+    assert len(nib) == 519
+    assert hashlib.sha256(nib).hexdigest() == IMAGE_SHA256
+    # Every serial/nibble upload stream misfits: no exact fit at any
+    # offset in either order, census at noise level (<=4 singletons).
+    checked = 0
+    for data_bit in DATA_BITS:
+        for byte_only in (False, True):
+            bts = bits_to_bytes_msb(
+                rise_bits(up, 8, data_bit, byte_only=byte_only))
+            if not bts:
+                continue
+            assert exact_fit_offsets(bts) == []
+            for order in ("BE", "LE"):
+                marks = census(words24(bts, order))
+                assert marks["total"] <= 4
+            checked += 1
+    for order_name, order in NIBBLE_MSB_ORDERS.items():
+        for byte_only in (False, True):
+            bts = bits_to_bytes_msb(nibble_bits(up, order, byte_only=byte_only))
+            assert exact_fit_offsets(bts) == []
+            for bo in ("BE", "LE"):
+                marks = census(words24(bts, bo))
+                assert marks["total"] <= 8
+            checked += 1
+    assert checked == 12
+    # Full-record nibble stream is idle-dominated (reply-spin 0x11).
+    full = bits_to_bytes_msb(nibble_bits(ped, NIBBLE_MSB_ORDERS["15-12"]))
+    assert len(full) == 12515
+    assert full.count(0x11) / len(full) > 0.93
