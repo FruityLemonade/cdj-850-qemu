@@ -64,8 +64,12 @@ static uint64_t cdj850_port_read(void *opaque, hwaddr off, unsigned size)
             v |= (uint64_t)CDJ850_PORT_READY_BIT << ((size - 1 - i) * 8);
         }
     }
-    /* DSP-driven input levels (HREQ/DSPDREQ+PE6/PE8 READY once the DSP
-     * is out of reset; loopback latch before that). */
+    /* Servo-gated input levels (Task 8n): PE6/PE8/SRVBUS0 READY only
+     * with $CDJ850_SERVO_READY=1 once the peer is alive; SRVBUS nibble
+     * with $CDJ850_SERVO_ACK at the sampler PCs. Default OFF = plain
+     * loopback/storage (servo state unmasked). Legacy DSP REPLY/PULSE/
+     * SEQ knobs remain compat-only; see dsp56371.c (8m: Port-E stream
+     * is servo init, not DSP upload). */
     v = cdj850_dsp_adjust_read(off, size, v, s->cpu->env.pc);
     if (cdj850_trace()) {
         info_report("cdj850: port read +0x%x size %u = 0x%x at pc=0x%08x "

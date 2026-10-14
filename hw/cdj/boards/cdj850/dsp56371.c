@@ -4,10 +4,19 @@
 #include "xc/trace.h"
 
 /*
- * Audio DSP peer (IC301, DSPC56371AF180) for MAIN's Port-E GPIO bit-bang
- * upload driver (bring-up 0x0C0FD7CC, gates 0x0C0FCA7A/0x0C0FCBB0,
- * transfer 0x0C0FC9DC, sampler 0x0C0FC8FA, collector 0x0C0FC8DC,
- * validator 0x0C0FC71C-87E; Task 8a §2e, 8b §§1-2).
+ * Servo Port-E peer + Audio-DSP compat shim (IC301 file home retained).
+ * CORRECTION (Task 8m §3, applied in 8n): the Port-E stream driven by
+ * bring-up 0x0C0FD7CC, gates 0x0C0FCA7A/0x0C0FCBB0, transfer 0x0C0FC9DC,
+ * sampler 0x0C0FC8FA, collector 0x0C0FC8DC, validator 0x0C0FC71C-87E
+ * (Task 8a §2e, 8b §§1-2) is SERVO init — MAIN→servo DSP IC201 TC94A15FG
+ * via SRVCCE (PE7) / SRVBCLK (PE8) / SRVBUS0-3 (PE12-15) plus RAM table
+ * staging at 0x0CE4B5D3 — NOT an Audio-DSP (IC301 DSPC56371AF180)
+ * upload. PE11/DSPDREQ is never driven/sampled in the stream, the AUDIO
+ * SPI master never runs, DSPCS never toggles. DSP upload happens
+ * elsewhere/later (post-park, unmapped). The 519 B recorded image kept at
+ * extract/cdj850/dsp_init_image.bin is therefore a servo init image;
+ * the filename is a misnomer retained for the bytes (see
+ * notes/cdj850-layout.md; SHA pin unchanged).
  *
  * What this models (Task 8c step 2):
  *
@@ -160,6 +169,46 @@
   *      boots, verdict MOVED-or-NOTHING; no duty-cycle sweeps, no new
   *    pins, no payloads beyond validator constants + echo transforms.
  *
+ * 6. EXPERIMENTAL servo READY gating + servo-peer ACK (Task 8n,
+ *    user-authorized, default OFF). Task 8m §3-§4 proved the Port-E
+ *    stream is servo init and the always-on PE6/PE8/PE12 READY ORs mask
+ *    servo state (PE6 = pulled-up spare, PE8 = SRVBCLK, PE12 = SRVBUS0
+ *    per probe Contradictions).
+ *    - $CDJ850_SERVO_READY=1 re-enables the legacy READY ORs (PE6/PE8/
+ *      PE12 H once alive) for controlled experiments. Unset (any value
+ *      but "1") = OFF = plain loopback/storage: reads return what MAIN
+ *      wrote (power-on zero), servo state unmasked. Normal boots are
+ *      byte-identical with all knobs OFF (control boot proves it; the
+ *      latch already holds H after bring-up so the gates still pass).
+ *    - $CDJ850_SERVO_ACK=55|seq|combo drives a scripted per-strobe
+ *      SRVBUS nibble (PE15:12, full 0xF0 bits incl. PE12) at the
+ *      sampler phase reads only (guest pcs 0x0C0FC922/0x0C0FC95C, same
+ *      discrimination as the DSP knobs). Non-sampler Port-E reads are
+ *      untouched (loopback/storage + READY iff enabled). Unset (or any
+ *      other value) = OFF = no nibble drive. Invalid = warn + OFF.
+ *      Every driven nibble is a validator-read constant (8g table +
+ *      8m §2): hi ∈ {5,7,D,F} passes [5E]==1 (needs PE12+PE14 H),
+ *      lo ∈ {1,5} passes collector-lo (0x0C104D64 needs lo ∈ {0,1,5};
+ *      0 excluded so PE12 stays 1/READY-safe). No invented payloads:
+ *      - 55: static nibble 5 (0101: PE12=1,PE13=0,PE14=1,PE15=0)
+ *        both phases → byte 0x55 (passes BOTH [5E] and lo; 8g sole
+ *        static intersection).
+ *      - seq: per-byte cycle through [5,7,D,F] (both phases share the
+ *        byte's nibble; bytes 0x55,0x77,0xDD,0xFF repeating). All hi
+ *        pass [5E]; lo mixed (only 0x55 passes lo) — tests whether the
+ *        ordered 10-byte collector prefers variation (8j rationale)
+ *        while staying inside the passing-hi set.
+ *      - combo: ph1 static 5 (merge-driving hi always passes), ph2
+ *        alternates [5,1] (bytes 0x55,0x51 alternating; both pass BOTH
+ *        checks; 0x51 = 81 inside every range bound per 8j).
+ *      Precedence at sampler reads: SERVO_ACK (full 0xF0 nibble) >
+ *      DSP_SEQ/DSP_REPLY (0xE0 bits) > loopback. SERVO_ACK sets
+ *      PE12=1 (all nibbles odd), so it wins over DSP_PULSE's clear
+ *      there; do not combine pulse+servo (untested, out of scope per
+ *      stop rules). Ground truth = pending hardware capture of SRVBUS
+ *      per-strobe nibbles (both sampler phases, SRVRST release through
+ *      reply-spin), which REPLACES these values.
+ *
  * What this does NOT do (honest limits):
  * - No DSP56371 core executes yet: the opcode census needs a complete
  *   recorded image first (step 3), and the validator's accept leg needs
@@ -219,6 +268,9 @@ typedef struct {
     unsigned seq_pos;   /* per-strobe position (advances on sampler reads) */
     uint8_t last_sent;  /* low byte of latest MAIN PEDRL write (echo src) */
     bool have_sent;     /* a PEDRL byte has been snooped since reset */
+    bool servo_ready;   /* Task 8n: READY ORs gated (default OFF) */
+    int servo_ack;      /* Task 8n: 0=OFF, 1=static55, 2=seq, 3=combo */
+    unsigned servo_pos; /* per-strobe position (advances on sampler reads) */
 } Cdj850Dsp;
 
 static Cdj850Dsp cdj850_dsp;
@@ -227,6 +279,8 @@ void cdj850_dsp_init(void)
 {
     const char *rep;
     const char *pulse;
+    const char *sready;
+    const char *sack;
 
     memset(&cdj850_dsp, 0, sizeof(cdj850_dsp));
     cdj850_dsp.reply_hi = -1;
@@ -289,6 +343,38 @@ void cdj850_dsp_init(void)
             }
         }
     }
+    /* Experimental servo READY gating (Task 8n): $CDJ850_SERVO_READY=1
+     * re-enables the legacy PE6/PE8/PE12 READY ORs once alive.
+     * Default OFF = plain loopback/storage (servo state unmasked). */
+    sready = getenv("CDJ850_SERVO_READY");
+    if (sready && strcmp(sready, "1") == 0) {
+        cdj850_dsp.servo_ready = true;
+        info_report("cdj850: servo ready: EXPERIMENTAL READY ON "
+                    "(CDJ850_SERVO_READY=1: PE6/PE8/PE12 H once alive; "
+                    "hardware capture replaces this)");
+    }
+    /* Experimental servo-peer ACK (Task 8n): $CDJ850_SERVO_ACK =
+     * 55|seq|combo. Default OFF. Parsed once; invalid = OFF + warn. */
+    sack = getenv("CDJ850_SERVO_ACK");
+    if (sack && *sack) {
+        if (strcmp(sack, "55") == 0) {
+            cdj850_dsp.servo_ack = 1;
+        } else if (strcmp(sack, "seq") == 0) {
+            cdj850_dsp.servo_ack = 2;
+        } else if (strcmp(sack, "combo") == 0) {
+            cdj850_dsp.servo_ack = 3;
+        } else {
+            info_report("cdj850: servo ack: ignoring bad CDJ850_SERVO_ACK "
+                        "'%s' (want 55|seq|combo), OFF", sack);
+            cdj850_dsp.servo_ack = 0;
+        }
+        if (cdj850_dsp.servo_ack) {
+            info_report("cdj850: servo ack: EXPERIMENTAL ACK ON "
+                        "(CDJ850_SERVO_ACK=%s: per-strobe SRVBUS PE15:12 "
+                        "nibble at sampler pcs 0x0C0FC922/0x0C0FC95C only; "
+                        "hardware capture replaces this)", sack);
+        }
+    }
 }
 
 static void cdj850_dsp_open_rec(void)
@@ -332,9 +418,10 @@ void cdj850_dsp_snoop_write(hwaddr off, uint64_t val, unsigned size,
         } else if (word == CDJ850_BRINGUP_S1C0 &&
                    cdj850_dsp.bringup == 0x140) {
             cdj850_dsp.alive = true;
-            info_report("cdj850: dsp bootstrap: DSPRST released "
-                        "(PEDRL 0x40→0x140→0x1C0), HREQ/DSPDREQ+PE6/PE8 "
-                        "READY asserted at pc=0x%08x %" PRIu64 " ms",
+            info_report("cdj850: servo/port-E bring-up done "
+                        "(PEDRL 0x40→0x140→0x1C0 = PE6 spare/SRVBCLK/SRVCCE; "
+                        "Task 8m: NOT DSPRST, which is not a PE pin), "
+                        "peer alive at pc=0x%08x %" PRIu64 " ms",
                         pc, ms);
         }
     }
@@ -383,30 +470,49 @@ uint64_t cdj850_dsp_adjust_read(hwaddr off, unsigned size, uint64_t v,
         return v;
     }
     cdj850_dsp.n_reads++;
-    /* OR the DSP-driven READY levels over PEDRL-overlapping bytes.
-     * Task 8h pulse: at the two sampler phase-read PCs with
-     * CDJ850_DSP_PULSE=1, PE12 is driven LOW (cleared) while PE8
-     * stays HIGH; everywhere else PE12 stays READY=1. PE6 (low
-     * byte) is never touched by either path. */
-    for (i = 0; i < size; i++) {
-        hwaddr a = off + i;
+    /* Gated READY (Task 8n): the legacy PE6/PE8/PE12 ORs run ONLY with
+     * $CDJ850_SERVO_READY=1 once alive. Default OFF = plain
+     * loopback/storage (servo state unmasked). Task 8h pulse: at the two
+     * sampler phase-read PCs with CDJ850_DSP_PULSE=1, PE12 is driven LOW
+     * (cleared) while PE8 stays HIGH — but only the enabled half applies:
+     * with READY OFF the HIGH elsewhere is the stored latch, not a force.
+     * PE6 (low byte) is never touched by either path. */
+    if (cdj850_dsp.servo_ready) {
+        for (i = 0; i < size; i++) {
+            hwaddr a = off + i;
 
-        if (a == CDJ850_PEDRL_OFF) {
-            /* High byte: PE8 (bit0 of byte) + PE12 (bit4 of byte). */
-            unsigned shift = (size - 1 - i) * 8;
+            if (a == CDJ850_PEDRL_OFF) {
+                /* High byte: PE8 (bit0 of byte) + PE12 (bit4 of byte). */
+                unsigned shift = (size - 1 - i) * 8;
 
-            if (cdj850_dsp.pulse_pe12 &&
-                (pc == CDJ850_SAMPLER_PH1_PC ||
-                 pc == CDJ850_SAMPLER_PH2_PC)) {
-                v |= (uint64_t)(CDJ850_DSP_PE8 >> 8) << shift;
-                v &= ~((uint64_t)((CDJ850_DSP_PE12 >> 8) & 0xFF) << shift);
-            } else {
-                v |= (uint64_t)(CDJ850_DSP_PE8 | CDJ850_DSP_PE12) >>
-                     8 << shift;
+                if (cdj850_dsp.pulse_pe12 &&
+                    (pc == CDJ850_SAMPLER_PH1_PC ||
+                     pc == CDJ850_SAMPLER_PH2_PC)) {
+                    v |= (uint64_t)(CDJ850_DSP_PE8 >> 8) << shift;
+                    v &= ~((uint64_t)((CDJ850_DSP_PE12 >> 8) & 0xFF)
+                           << shift);
+                } else {
+                    v |= (uint64_t)(CDJ850_DSP_PE8 | CDJ850_DSP_PE12) >>
+                         8 << shift;
+                }
+            } else if (a == CDJ850_PEDRL_OFF + 1) {
+                /* Low byte: PE6. */
+                v |= (uint64_t)CDJ850_DSP_PE6 << ((size - 1 - i) * 8);
             }
-        } else if (a == CDJ850_PEDRL_OFF + 1) {
-            /* Low byte: PE6. */
-            v |= (uint64_t)CDJ850_DSP_PE6 << ((size - 1 - i) * 8);
+        }
+    } else if (cdj850_dsp.pulse_pe12 &&
+               (pc == CDJ850_SAMPLER_PH1_PC ||
+                pc == CDJ850_SAMPLER_PH2_PC)) {
+        /* Pulse-only with READY gated OFF: clear PE12 at the sampler
+         * reads over the stored latch (PE8 left as stored). Untested
+         * combo; documented so the pulse knob stays honest without
+         * re-introducing an always-on force. */
+        for (i = 0; i < size; i++) {
+            if (off + i != CDJ850_PEDRL_OFF) {
+                continue;
+            }
+            v &= ~((uint64_t)((CDJ850_DSP_PE12 >> 8) & 0xFF)
+                   << ((size - 1 - i) * 8));
         }
     }
     /* Experimental reply drive (Task 8g, default OFF): the DSP owns
@@ -484,6 +590,44 @@ uint64_t cdj850_dsp_adjust_read(hwaddr off, unsigned size, uint64_t v,
                 }
                 v &= ~((uint64_t)0xE0 << shift2);
                 v |= (uint64_t)((nib3b & 7) << 5) << shift2;
+            }
+        }
+    }
+    /* Experimental servo-peer ACK (Task 8n, default OFF): the servo owns
+     * the SRVBUS nibble PE15:12. Active modes override the DSP 0xE0 bits
+     * above with the full 0xF0 nibble at the sampler reads only (so
+     * PE12=1 wins there over the pulse clear; do not combine). */
+    {
+        bool at_ph1 = (pc == CDJ850_SAMPLER_PH1_PC);
+        bool at_ph2 = (pc == CDJ850_SAMPLER_PH2_PC);
+        /* Validator-passing hi set (all PE12=1,PE14=1): 5=0101, 7=0111,
+         * D=1101, F=1111. Lo set (PE12=1): 5=0101, 1=0001. */
+        static const int hi_cyc[4] = { 5, 7, 0xD, 0xF, };
+
+        if (cdj850_dsp.servo_ack && (at_ph1 || at_ph2)) {
+            unsigned pos = cdj850_dsp.servo_pos++;
+            int nib4 = 5;
+
+            if (cdj850_dsp.servo_ack == 1) {
+                nib4 = 5;
+            } else if (cdj850_dsp.servo_ack == 2) {
+                nib4 = hi_cyc[(pos / 2) % 4];
+            } else {
+                if (at_ph1) {
+                    nib4 = 5;
+                } else {
+                    nib4 = ((pos / 2) % 2) ? 1 : 5;
+                }
+            }
+            for (i = 0; i < size; i++) {
+                unsigned shift3;
+
+                if (off + i != CDJ850_PEDRL_OFF) {
+                    continue;
+                }
+                shift3 = (size - 1 - i) * 8;
+                v &= ~((uint64_t)0xF0 << shift3);
+                v |= (uint64_t)((nib4 & 0xF) << 4) << shift3;
             }
         }
     }
