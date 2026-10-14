@@ -752,6 +752,54 @@ scripts in /tmp only (uncommitted); no new extract files.
   strobe clocks from DSPRST release, §10.14-style).
 - Suite: `test_sh2a_smoke + test_firmware_cdj850` 13 passed.
 
+## Task 8j: scripted validator-ordered reply sequences — NOTHING (honest negative; 2026-10-14)
+
+Full report:
+.superpowers/sdd/2026-10-12-cdj850-support/task-8j-report.md.
+Branch `cdj850-bringup`, BASE `9025648` (actual HEAD; brief named
+`03becd1`, superseded by the VFD-1 commit). EB
+`~/qemu-build-eb/qemu-system-sh4eb` (rebuilt once; warning-free
+apart from the pre-existing `ld: -undefined error` notice). No
+subagents. No bridge. Firmware read-only; run/probe scripts in
+/tmp only (uncommitted); no new extract files. Marathon boot
+untouched (shared CPU only).
+
+- Hypothesis (untried dynamic dimension): all prior driving was
+  STATIC; the validator collects 10 bytes in ORDER, so a scripted
+  per-strobe sequence from validator constants + echo-of-last-sent
+  (a DSP ACKing uploads is the most common real protocol) was
+  still driver-justified.
+- Knob: `CDJ850_DSP_SEQ=order|echo|combo` (default OFF; 8g/8h
+  static modes intact): per-strobe PE15:13 pattern advancing one
+  step per sampler phase read (`0x0C0FC922`/`0x0C0FC95C`);
+  overrides static REPLY at sampler reads only; composes with
+  PULSE (sequencer never touches PE12/PE6/PE8). order = 20-nibble
+  cycle (bytes 51 11 55*6 55 71: B0 lo=1 in {0,1,5} + [5E]-pass
+  hi + inside all range bounds); echo = 3-bit windows of the
+  last MAIN PEDRL upload byte (identity low-bits + windows);
+  combo = ph1 order nibble + ph2 echo window. Branch-polarity
+  correction vs 8g: the `[02]==0` leg needs byte6==0 (not !=0) —
+  unreachable under PE12=1 (min byte 0x11); the `[02]!=0` leg
+  needs only byte0-lo in {0,1,5} (B0=0x51 satisfies it).
+- Live proof (probes, not verdict boots): order — consecutive PH2
+  hits show PE15:13 0 then 2 (pattern advances per strobe; probe
+  m-reads/steps consume elements, noted); echo — 12 s trace:
+  4362/4362 PH2 + 4362/4362 PH1 reads carry exact 3-bit windows
+  of the latest PEDRL upload byte.
+- 3 verdict boots (40 s): order → sample 0x55, flags 01 00 01 00,
+  `[5E]=1` (same genuine progress as 8g k22/k33, not movement);
+  echo → sample 0x11, flags 01 00 00 00 (== control; echoing the
+  spin's own strobes reproduces the latch); combo → sample 0x51,
+  flags 01 00 01 00, `[5E]=1`. All three: `[4F]/[67]/[02]/[A6]/
+  [AE9]` + ACCEPT + MASK + collector + `[54]/[EB]/[652]/[CF6]/
+  [BC]/[AE8]/[882]/[D3]/[AF]/[89B]/[8C7]/[8FC]` all zero; stop
+  PCs park (`0x0C0B8F04` x2) / panel-driver range (`0x0C077900`).
+- Verdict NOTHING: no accept/mask/collector/dispatch change vs
+  8g/8h baselines. Sequences join statics as exhausted; only
+  remaining path is hardware capture (per-strobe PE12-15 +
+  strobe clocks from DSPRST release, §10.14-style).
+- Suite: `test_sh2a_smoke + test_firmware_cdj850` 15 passed.
+
 ## Task 8i: SPI-bitstream re-decode — NOT-SPI (offline; 2026-10-13)
 
 Full report:
