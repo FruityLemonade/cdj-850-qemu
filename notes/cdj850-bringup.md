@@ -785,3 +785,86 @@ Firmware read-only; no new extract files.
   `c850_shi_search`, GPL-2.0-or-later + SPDX) + tests
   `test_c850_spi_synthetic` / `test_c850_spi_record_pins` (11 passed
   in `test_firmware_cdj850.py`; 63 passed smoke + firmware subset).
+
+## Task VFD-1: MAIN display-command format mapped; vfd.c decodes frames (2026-10-14)
+
+Verdict: panel-side-opaque (MAIN sends control indices only; the panel
+CPU renders all glass text from its own ROM). vfd.c passes the exchange
+frame bytes through as hex, synced on TX[0].bit7. No firmware bytes in
+tests (synthetic only). Firmware read-only (C850MAIN.UPD); image via
+scripts/firmware/c850_unpack.py (SDRAM base 0x0C000000, BE SH-2A).
+
+Method: correct SH-2A disassembler (movi20/s imm20 = (op[7:4]<<16)|w2,
+sign-extended from bit 19, S-variant <<8; mov32-disp12 0x3nm1 + sub nibble;
+bitop32 0x3n09; 16-bit 0x86xx/0x87xx BCLR/BSET/BST/BLD; rts/n 0x006B;
+nott 0x0068; SHAD 0x4nmC -- all confirmed against
+qemu-src/target/sh4/translate.c + the live 0xFFFE391E load at
+0x0C08E8EE), then BE32 pool sweep + BSR sweep + live TX/RX trace
+(25 s parked boot, /tmp/vfd1probe.main.log).
+
+### Builders (PCs + evidence)
+
+- Panel exchange wrapper 0x0C077570 (6-byte full duplex: TX staging
+  0x0C7F671B, RX 0x0C7F6721; inner TX pc 0x0C077808, single RX reader
+  pc 0x0C077886; SSU MMIO via movi20: 0xFFFE7000/01/02/03/04/06/07/0A).
+  Exactly 3 callers (BE32 pools holding 0x0C077570): cddabuff
+  (0x0C006108, tail-call 0x0C005F36 / 0x0C005F4C), DjControl (0x0C014EE8,
+  jsr 0x0C014E14), DataIn (0x0C0159C8, jsr 0x0C0158A6). No BSR/BRA
+  callers; no other BE32 refs into 0x0C077000-0x0C079000 outside the
+  driver cluster, boot/init, and these three tasks (full-image sweep).
+- Shared TX-prep 0x0C005D54 (called by all three sites): TX[0] = mode
+  byte [0x0C7F66C8] ORed with state bits -- bset #7 (0x0C005D78,
+  unconditional), bset/bclr #6 (0x0C005D94/96), bst #5 from
+  [0x0C7F672A] (0x0C005DA0), bset/bclr #4 (0x0C005DF0/F2), bset/bclr #1
+  (0x0C005E4C/4E); clears display flags [0x0CE6D12E/12F]; bit-tests
+  the 0x3A4-stride object table (base 0x0CE59B50, bld.b #5/#6
+  @(0x3A1,r2)).
+- cddabuff TX builder 0x0C005F04: TX[0]=r5, TX[1]=r0, TX[2]=r14,
+  TX[3]=(r13&r4)>>16, TX[4]=(r13&r7)>>8, TX[5]=r13 (24-bit value split).
+  Second variant 0x0C005F3A masks TX[0] with ~13 before re-exchange.
+- 16-bit command driver 0x0C07800A (word param, stack+10): HI byte to
+  SSTDR0 (pc 0x0C078236), LO byte to SSTDR1 (pc 0x0C07824E); TEND-polled.
+  Word feeder: [0x0C7F6728] = 0x1310 if object-table +0x3A1 bit4 set
+  else 0x1300 (builder 0x0C006386-9E); bit 8 of the shadow word at
+  [0x0CE634B6] set/cleared by 0x0C006294.
+- Boot upload 0x0C077B06/0x0C077C6C (TE-only): 1140 binary panel-init
+  bytes, zero ASCII runs, none of MAIN's message strings present.
+- DisplayTask entry 0x0C061454 (task-table ref 0x0C154494, name
+  "DisplayTask" 0x0C1544A8): 10-sub-handler poll loop. Display RAM:
+  0x0C9D1xxx frame buffers (cleared by 0x0C069FAE, 100 B/0x100 B),
+  flags 0x0CE6D1xx. Message tables: 16 B entries 0x0C1544C8-0x0C15472F
+  (EJECT/NO DISC/LOAD IN/...), browser/FX text 0x0C154738-0x0C154908
+  (Track/ROOT/TRANS/HOLD/WAH/JET/ROLL/PC MODE), utility/charset
+  0x0C154918-0x0C154A57 (charset 0x0C154A12: 03 ABC..789!?&@.. 02 +
+  0123456789ABCDEF; refs from 0x0C067xxx utility code + 0x0C0E8A60).
+  10-byte candidate 0x0C154A88 (77 12 6B 5B 1E 5D 7D 13 7F 5F) has ZERO
+  BE32 refs: unreferenced data, NOT claimed as a segment map.
+
+### Display-vs-control split (proven)
+
+- DisplayTask module (0x0C061xxx-0x0C071xxx) holds no SSU driver
+  pointers (full-image BE32 sweep: all 0x0C077xxx-0x0C078xxx refs land
+  in cddabuff/DjControl/DataIn/boot/init pools) and no movi20 to
+  0xFFFE70xx (full-image sweep: all such loads are inside the SSU
+  driver cluster itself). Display state reaches the panel ONLY through
+  the shared 6-byte exchange + 16-bit words assembled from shared RAM.
+- Wire (parked 25 s boot): 1140 upload + 1070 exchange frames, ALL
+  `C2 00 00 08 00 00` (distinct 6-byte patterns: 1) + 3 init words
+  0x1604/0x10FF/0x11FF then 1070 x 0x1300 (one per poll, ~6 ms after
+  its frame); 6420 RX reads all at 0x0C077886 (1:1 full duplex).
+  RX idle `00 00 00 01 01 01`. Zero ASCII/text bytes anywhere.
+- Therefore the exchange/16-bit traffic is control/indices (mode +
+  flag bits + 24-bit state + opcode words); glyph rendering is
+  panel-CPU-side (manual: DATA FL via D_DSO/D_SCLK/D_LAT/D_BK, JOG FL
+  via J_DSO/J_SCLK/J_LAT/J_BK, both from IC1007). MAIN's text tables
+  have no code path to any SSU TX site (exhaustive pool/branch/movi20
+  sweep); they serve state-side UI only.
+- vfd.c implements index passthrough: hex frame + frame count, synced
+  on TX[0].bit7 (builder-proven). `?`+log-once retained (never fires
+  on hex; kept for the DisplayTask-text future). vfd_text() signature
+  and headless safety unchanged.
+- Blind spots (concerns): SSTDR1 (+7) bytes are NOT captured by ser.c
+  (16-bit LO bytes invisible to vfd_note_tx; HI bytes arrive, so words
+  cannot be reassembled in vfd.c); upload-phase windows are unaligned
+  raw bytes until polling locks sync; a future 16-bit word with HI
+  bit7 set would cost 1-2 misaligned frames before relock.
