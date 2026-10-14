@@ -79,9 +79,39 @@ static const uint8_t panel_idle_frame[6] =
  * to the idle default. Shapes stay driver-justified: keep RX[3]&0x0F,
  * RX[4], RX[5] nonzero (DjControl gate 0x0C014822) unless the run
  * explicitly probes the discard path.
+ *
+ * Task 8l: SEQUENCED mode (EXPERIMENTAL test hook, default OFF). New env
+ * value syntax (keywords, NOT hex): $CDJ850_PANEL_RX=seq40|seq20|seq10|
+ * seqall. Each 6-byte frame served is [SEQ_k,01,01,01,01,01] where SEQ_k
+ * cycles through the route selectors for one bank triple (seq40: 40/41/42;
+ * seq20: 20/21/22; seq10: 10/11/12) or all three triples in bank order
+ * (seqall: 40/41/42/20/21/22/10/11/12). RX[1]/RX[2]=0x01 is the routed
+ * value 0x0101 (as the Task 8k active-frame probes); tail 01 01 01 keeps
+ * the DjControl gate (0x0C014822) passing. Sequencing rule: the sequence
+ * advances one step per 6-byte frame at the byte-0 slot; panel_exchange_
+ * start() only re-aligns rx_pos to 0 and never itself advances (a mid-
+ * frame restart therefore serves the NEXT selector, not a repeat). First
+ * frame after reset serves list[0]. Static-hold behavior is byte-identical
+ * when sequenced mode is unused. All bytes remain synthetic test vectors
+ * (disclaimed, never cited as key codes); shapes stay driver-justified
+ * (cddabuff routing 0x0C005F6E + tail consumer 0x0C00600E).
  */
 static uint8_t panel_held_frame[6];
 static bool panel_hold_active;
+
+/* Task 8l sequenced lists (routing shapes from disassembly, NOT key codes). */
+static const uint8_t panel_seq40_list[3] =
+    { 0x40, 0x41, 0x42 };
+static const uint8_t panel_seq20_list[3] =
+    { 0x20, 0x21, 0x22 };
+static const uint8_t panel_seq10_list[3] =
+    { 0x10, 0x11, 0x12 };
+static const uint8_t panel_seqall_list[9] =
+    { 0x40, 0x41, 0x42, 0x20, 0x21, 0x22, 0x10, 0x11, 0x12 };
+static const uint8_t *panel_seq_list;
+static unsigned panel_seq_len;
+static unsigned panel_seq_pos;
+static bool panel_seq_active;
 
 void panel_link_init(void)
 {
@@ -90,6 +120,32 @@ void panel_link_init(void)
     const char *p;
 
     if (!e || !*e) {
+        return;
+    }
+    /* Task 8l sequenced keywords (new syntax; static hex path untouched). */
+    if (strcmp(e, "seq40") == 0 || strcmp(e, "seq20") == 0 ||
+        strcmp(e, "seq10") == 0 || strcmp(e, "seqall") == 0) {
+        if (strcmp(e, "seq40") == 0) {
+            panel_seq_list = panel_seq40_list;
+            panel_seq_len = 3;
+        } else if (strcmp(e, "seq20") == 0) {
+            panel_seq_list = panel_seq20_list;
+            panel_seq_len = 3;
+        } else if (strcmp(e, "seq10") == 0) {
+            panel_seq_list = panel_seq10_list;
+            panel_seq_len = 3;
+        } else {
+            panel_seq_list = panel_seqall_list;
+            panel_seq_len = 9;
+        }
+        panel_seq_pos = 0;
+        panel_seq_active = true;
+        panel_hold_active = false;
+        info_report("cdj850: panel link: EXPERIMENTAL sequenced hold ON "
+                    "(CDJ850_PANEL_RX=%s: per-frame RX[0] cycle, "
+                    "RX[1]/RX[2]/tail 01: synthetic test vector, NOT "
+                    "panel-matrix key codes; hardware capture replaces "
+                    "this)", e);
         return;
     }
     p = e;
@@ -136,6 +192,8 @@ static struct {
 
 void panel_exchange_start(void)
 {
+    /* Task 8l: re-align only; the sequenced list advances at the byte-0
+     * slot in panel_ssu_rx_byte(), never here. */
     panel.rx_pos = 0;
 }
 
@@ -147,7 +205,12 @@ uint8_t panel_ssu_rx_byte(void)
 
     if (!panel.rx_logged) {
         panel.rx_logged = true;
-        if (panel_hold_active) {
+        if (panel_seq_active) {
+            info_report("cdj850: panel link serving sequenced frames "
+                        "(per-frame RX[0] cycle len %u, "
+                        "RX[1]/RX[2]/tail 01)",
+                        panel_seq_len);
+        } else if (panel_hold_active) {
             info_report("cdj850: panel link serving held frame "
                         "(%02x %02x %02x %02x %02x %02x)",
                         frame[0], frame[1], frame[2],
@@ -168,6 +231,19 @@ uint8_t panel_ssu_rx_byte(void)
         info_report("cdj850: panel link key 0x%02x queued but key-event "
                     "format unmapped; holding idle frame",
                     panel.pending_key);
+    }
+    if (panel_seq_active) {
+        /* Task 8l sequenced frame: [SEQ_k,01,01,01,01,01]. Advance one
+         * step per frame at the byte-0 slot so cycling is per-exchange
+         * regardless of the SSER RE-toggle cadence. */
+        if (panel.rx_pos == 0) {
+            b = panel_seq_list[panel_seq_pos];
+            panel_seq_pos = (panel_seq_pos + 1) % panel_seq_len;
+        } else {
+            b = 0x01;
+        }
+        panel.rx_pos = (panel.rx_pos + 1) % sizeof(panel_idle_frame);
+        return b;
     }
     b = frame[panel.rx_pos];
     panel.rx_pos = (panel.rx_pos + 1) % sizeof(panel_idle_frame);
