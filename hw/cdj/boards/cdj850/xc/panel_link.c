@@ -63,6 +63,66 @@
 static const uint8_t panel_idle_frame[6] =
     { 0x00, 0x00, 0x00, 0x01, 0x01, 0x01 };
 
+/*
+ * Task 8k: hold-at-reset frame override (EXPERIMENTAL test hook, default
+ * OFF). $CDJ850_PANEL_RX holds six hex bytes (e.g. 40:01:01:01:01:01,
+ * colons optional) served INSTEAD of the idle frame from the first
+ * exchange after reset -- the MAIN-side equivalent of "keys held at
+ * power-on" for the service-mode entries (manual §6: BACK+TEMPO panel
+ * diag, TIME+CD SELECT drive diag, USB SELECT+RELOOP updater, BACK+USB
+ * SELECT factory reset) and for the cddabuff non-idle branches.
+ *
+ * The bytes are operator-chosen test vectors, NOT real panel-matrix key
+ * codes: the key-event reply format is unmapped (panel_send_key still
+ * holds idle), so no value here may be cited as what the panel CPU
+ * sends for a named key. Unset (or malformed) = OFF = byte-identical
+ * to the idle default. Shapes stay driver-justified: keep RX[3]&0x0F,
+ * RX[4], RX[5] nonzero (DjControl gate 0x0C014822) unless the run
+ * explicitly probes the discard path.
+ */
+static uint8_t panel_held_frame[6];
+static bool panel_hold_active;
+
+void panel_link_init(void)
+{
+    const char *e = getenv("CDJ850_PANEL_RX");
+    unsigned i, v;
+    const char *p;
+
+    if (!e || !*e) {
+        return;
+    }
+    p = e;
+    for (i = 0; i < 6; i++) {
+        while (*p == ':' || *p == ' ') {
+            p++;
+        }
+        if (sscanf(p, "%2x", &v) != 1 || v > 0xFF) {
+            info_report("cdj850: panel link: ignoring bad CDJ850_PANEL_RX "
+                        "'%s' (want 6 hex bytes), holding idle", e);
+            return;
+        }
+        panel_held_frame[i] = (uint8_t)v;
+        p += 2;
+    }
+    while (*p == ':' || *p == ' ') {
+        p++;
+    }
+    if (*p) {
+        info_report("cdj850: panel link: ignoring bad CDJ850_PANEL_RX "
+                    "'%s' (want 6 hex bytes), holding idle", e);
+        return;
+    }
+    panel_hold_active = true;
+    info_report("cdj850: panel link: EXPERIMENTAL hold-at-reset ON "
+                "(CDJ850_PANEL_RX=%02x:%02x:%02x:%02x:%02x:%02x: synthetic "
+                "test vector, NOT panel-matrix key codes; hardware capture "
+                "replaces this)",
+                panel_held_frame[0], panel_held_frame[1],
+                panel_held_frame[2], panel_held_frame[3],
+                panel_held_frame[4], panel_held_frame[5]);
+}
+
 static struct {
     uint8_t tx_ring[PANEL_TX_RING];
     unsigned tx_head;
@@ -82,11 +142,20 @@ void panel_exchange_start(void)
 uint8_t panel_ssu_rx_byte(void)
 {
     uint8_t b;
+    const uint8_t *frame =
+        panel_hold_active ? panel_held_frame : panel_idle_frame;
 
     if (!panel.rx_logged) {
         panel.rx_logged = true;
-        info_report("cdj850: panel link serving status frames "
-                    "({00 00 00 01 01 01} idle)");
+        if (panel_hold_active) {
+            info_report("cdj850: panel link serving held frame "
+                        "(%02x %02x %02x %02x %02x %02x)",
+                        frame[0], frame[1], frame[2],
+                        frame[3], frame[4], frame[5]);
+        } else {
+            info_report("cdj850: panel link serving status frames "
+                        "({00 00 00 01 01 01} idle)");
+        }
     }
     if (panel.key_pending && !panel.key_logged) {
         /*
@@ -100,7 +169,7 @@ uint8_t panel_ssu_rx_byte(void)
                     "format unmapped; holding idle frame",
                     panel.pending_key);
     }
-    b = panel_idle_frame[panel.rx_pos];
+    b = frame[panel.rx_pos];
     panel.rx_pos = (panel.rx_pos + 1) % sizeof(panel_idle_frame);
     return b;
 }

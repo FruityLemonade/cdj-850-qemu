@@ -19,6 +19,10 @@ uint8_t panel_ssu_rx_byte(void);
  * frame restarts at byte 0. */
 void panel_exchange_start(void);
 
+/* Task 8k: parse the hold-at-reset frame override (see panel_link.c).
+ * Called once from board init; default (unset/invalid) is the idle frame. */
+void panel_link_init(void);
+
 /* One MAIN->panel byte, for the FL/lamp frame capture (vfd.c). */
 void panel_ssu_tx_byte(uint8_t b);
 

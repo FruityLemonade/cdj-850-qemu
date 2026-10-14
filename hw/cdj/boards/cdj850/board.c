@@ -449,6 +449,7 @@ static void cdj850_init(MachineState *machine)
     cdj850_ccnaudit_init(sysmem, cpu);
     /* Panel link + VFD text window (MAIN-side model; panel CPU not
      * emulated). The window stays empty under -nographic. */
+    panel_link_init();
     vfd_init();
 
     /* On-chip peripheral block (BSC/CPG, less CCR/INTC/CMT/ports modelled
