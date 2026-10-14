@@ -982,3 +982,46 @@ in /tmp only (uncommitted).
   has no pool caller; its entry is `bsr 0x0C0FF610` from
   `0x0C0FF7D4` when `[[0x0C0FF9F8]]` != 0 (both zero in park).
 - Suite: `test_sh2a_smoke + test_firmware_cdj850` 15 passed.
+
+## Task 8l: sequenced panel hold (bank triples) — NOTHING, consumer fires into nothing new (2026-10-14)
+
+Full report:
+.superpowers/sdd/2026-10-12-cdj850-support/task-8l-report.md.
+Branch `cdj850-bringup`, BASE `c24a201` (actual HEAD at task time).
+EB `~/qemu-build-eb/qemu-system-sh4eb` (rebuilt once via
+`./build.sh display`; warning-free apart from the pre-existing
+`ld: -undefined error` notice). No subagents. Firmware read-only;
+derived images untouched in untracked `extract/cdj850/`; run/probe
+scripts in /tmp only (uncommitted: reused `/tmp/8k-run.py`, new
+`/tmp/8l-run3.py` triple-read).
+
+- Mechanism (committed): `CDJ850_PANEL_RX=seq40|seq20|seq10|seqall`
+  (new keyword syntax; default OFF; static six-hex-byte holds
+  byte-identical when sequenced unused). Each frame is
+  `[SEQ_k,01,01,01,01,01]` (`0x0101` routed value as the 8k active
+  probes; tail `01 01 01` keeps the DjControl gate passing).
+  Sequencing rule: advance one step per 6-byte frame at the byte-0
+  slot; `panel_exchange_start()` only re-aligns `rx_pos` (a mid-frame
+  restart serves the NEXT selector — pinned by test). First frame
+  serves `list[0]`. All bytes documented SYNTHETIC test vectors, never
+  key codes. Tests: `tests/test_cdj850_panel_seq.py` (7 tests, TDD
+  red→green on the REAL `panel_link.c`).
+- Boots (3): (a) `seq40` 30 s: RX `41 ...` in situ, 0x40 bank 2/3
+  filled (`672C/672E=0101`); (b) `seqall` 30 s: RX `11 ...`, 0x40 AND
+  0x20 triples `0000` (CLEARED — consumer fired twice), 0x10 2/3
+  mid-fill; (c) `seq40` triple-read one boot (~30/34/38 s): 1-filled
+  → 1-filled → 0-with-`42`-in-situ (dynamic just-cleared proof).
+  Fill AND clear cycle continuously, in every bank. `[82A]`/mask/
+  ACCEPT/collector/sample(`0x11`)/flags unchanged (all zero) in all 5
+  snapshots; stops at known park/tick/sustained-spin PCs
+  (`fff8dca2` tick ISR, `0c0d69b4` SD spin, same-family others —
+  fixed-time-break variance, not movement).
+- Verdict NOTHING (honest stop): the tail consumer
+  (`jsr @[0x0C006130]=0x0C0723EC`) fires repeatedly but into nothing
+  observable — no cddabuff state advance in the evidence block, no
+  `[82A]`, no park movement. Panel-RX story complete: static (8k,
+  single fills, no fire) + active (8k, routing) + sequenced (8l,
+  triples fire, nothing downstream) all explored. No riding further;
+  no key-code guessing/fuzzing/other pins/DSP combos (bound honored).
+- Suite: `test_sh2a_smoke + test_firmware_cdj850 + test_cdj850_vfd +
+  test_cdj850_panel_seq` 28 passed.
