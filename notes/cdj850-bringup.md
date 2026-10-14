@@ -916,3 +916,69 @@ qemu-src/target/sh4/translate.c + the live 0xFFFE391E load at
   cannot be reassembled in vfd.c); upload-phase windows are unaligned
   raw bytes until polling locks sync; a future 16-bit word with HI
   bit7 set would cost 1-2 misaligned frames before relock.
+
+## Task 8k: service-mode holds, USB-attached boot, panel ACTIVE frames (2026-10-14)
+
+Full report:
+.superpowers/sdd/2026-10-12-cdj850-support/task-8k-report.md.
+Branch `cdj850-bringup`, BASE `8c79b14` (actual HEAD at task time).
+EB `~/qemu-build-eb/qemu-system-sh4eb` (rebuilt once via
+`./build.sh display`; warning-free apart from the pre-existing
+`ld: -undefined error` notice). No subagents. No bridge. Firmware
+read-only (`C850MAIN.UPD` never written; one COPY staged onto a USB
+image, source untouched); derived images only in untracked
+`extract/cdj850/` (`usb-8k.img`, `usb-upd-8k.img`); run/probe scripts
+in /tmp only (uncommitted).
+
+- Key injection at reset: NONE existed. `panel_send_key` has zero
+  callers (holds idle; key-event format unmapped); `boot_main.sh` and
+  deck pass no keys to cdj850 (no panel socket/env on this board;
+  `cdj_panelkeys.h` report bits belong to the cdj2000-family
+  GUI-board socket, NOT the cdj850 SSU frame — reusing them as SSU
+  bytes would be invention). boot.bin holds no SSU/port movi20 refs.
+  The power switch goes to the PANEL CPU (manual §5 [1-1]) and the
+  panel diag is a "Panel microcomputer function" (manual §6) — held
+  keys are panel-side inputs; MAIN can only react over serial.
+- Mechanism (committed): `CDJ850_PANEL_RX=bb:bb:bb:bb:bb:bb`
+  (panel_link.[ch] + board.c init call, default OFF = byte-identical
+  idle). Values are documented SYNTHETIC test vectors, never cited
+  as panel-matrix key codes (matrix unknown). Causality proven live:
+  held `40:01:01:01:01:01` reads back in situ at `0x0C7F6721`.
+- (1) SERVICE-MODE BOOTS (5 modes + idle control, 30 s each): all
+  park identically (mask `0x0CE49CD0` = 0, ACCEPT `[0x0CE4B8F5]` = 0,
+  `[82A]` = 0, stop PCs known park/tick spins). No mode bypasses the
+  DSP handshake (Port-E untouched by panel RX); panel diag is
+  panel-side by construction; RELOOP-10s version is a runtime hold,
+  unreachable while parked; updater/factory/drive entries show no
+  MAIN-side divergence. Verdict NOTHING per mode (honest stop).
+- (2) USB-ATTACHED BOOT: images built per repo flow
+  (`scripts/media/make_usb_image.py`, 32 MB FAT16; `usb-8k.img` = 3
+  user WAVs, `usb-upd-8k.img` = + `C850MAIN.UPD` copy; contents
+  re-listed via pyfatfs). Attach fails at the QEMU command line:
+  `-device usb-storage: No 'usb-bus' bus found` — the cdj850 machine
+  defines no USB host controller, so no device can reach the
+  firmware. USB block (`0xFFFC1C00`) sees only bounded init writes
+  (SYSCFG/INTENB/PIPESEL shapes, `-d unimp` 15 s boot); no
+  enumeration without a controller model. Verdict NOTHING (blocked
+  at harness; model nothing, characterized).
+- (3) PANEL ACTIVE FRAMES (3/3 variants, all routing shapes from the
+  disassembled 0x0C005F6E branches): `40:01:01:01:01:01` stores
+  `0x0101` at `[0x0C7F672C]`, `41:...` at `[0x0C7F672E]`,
+  `20:...` at `[0x0C7F6732]` — first live execution of the cddabuff
+  non-idle route, bank/nibble-exact. Consumer
+  (`jsr @[0x0C006130]`, needs a bank triple) never fires (static
+  hold fills one word; words persist); cold path `0x0C0FF610`
+  / `[82A]` store `0x0C0FF6B0` never executes (`[82A]` = 0 —
+  panel RX has no writer path to it); mask/collector/accept
+  unchanged. Verdict MOVED (new firmware state, ridden within task
+  across all 3 banks) with no park movement; stop (triple-fill
+  needs a sequenced hold — beyond the variant bound, noted as
+  follow-up, not built).
+- Also: RX-buf "6th ref" `0x0C0D5C14` is a `mac.l` encoding
+  coincidence, not a reader (5 real refs: 3 exchange pools +
+  2 arg loads). DjControl accept stores resolve to flag
+  `[0x0C7F663C]=1` + dst `[0x0C7F65BC]` (pool-gated downstream of
+  task-state compares — still zero live). Cold func `0x0C0FF640`
+  has no pool caller; its entry is `bsr 0x0C0FF610` from
+  `0x0C0FF7D4` when `[[0x0C0FF9F8]]` != 0 (both zero in park).
+- Suite: `test_sh2a_smoke + test_firmware_cdj850` 15 passed.
