@@ -119,9 +119,46 @@
  *      idles HIGH with a brief LOW pulse per transaction" (8c
  *      rendering) - i.e. the quiescent/ready level is HIGH, and
  *      LOW is only the momentary per-transfer assertion.
- *    Scope bound (8h brief): one micro-experiment, at most 2
- *    boots, verdict MOVED-or-NOTHING; no duty-cycle/timing
- *    sweeps, no other pins.
+  *    Scope bound (8h brief): one micro-experiment, at most 2
+  *    boots, verdict MOVED-or-NOTHING; no duty-cycle/timing
+  *    sweeps, no other pins.
+  *
+  * 5. EXPERIMENTAL sequenced reply (Task 8j, user-authorized, default
+  *    OFF). All prior driving was STATIC (same nibble every strobe),
+  *    but the validator runs in a loop collecting 10 bytes and
+  *    checking them in ORDER - so a scripted per-strobe SEQUENCE is
+  *    still driver-justified and was entirely untried.
+  *    $CDJ850_DSP_SEQ=order|echo|combo serves a scripted per-strobe
+  *    PE15:13 nibble list cycling over a short pattern, advancing one
+  *    step per sampler phase read (guest pcs 0x0C0FC922/0x0C0FC95C).
+  *    Non-sampler Port-E reads are untouched (loopback/READY as
+  *    before); static $CDJ850_DSP_REPLY is overridden ONLY at the
+  *    sampler reads while a sequence is active; $CDJ850_DSP_PULSE
+  *    still governs PE12 (the sequencer drives PE15:13 = 0xE0 bits
+  *    only, never PE12/PE6/PE8). Unset (or any other value) = OFF =
+  *    8g/8h static behavior, byte-identical. Invalid = warn + OFF.
+  *    - order: 20-nibble cycle = 10 bytes in validator-check order:
+  *      B0=0x51 (merge/[5E] hi=5 passes per the 8g table, collector
+  *      byte0 lo=1 in {0,1,5}, 81 inside every range bound), B1=0x11,
+  *      B2-B7=0x55, B8=0x55 (85<=153, <=95), B9=0x71 (113<117,
+  *      [5E] hi=7). Nibbles (PE15:13) : 2,0,0,0,2,2,2,2,2,2,2,2,
+  *      2,2,2,2,2,2,3,0 - every value in {0,2,3}, i.e. drawn from
+  *      the 8g static set, no invented payload. (Branch-polarity
+  *      correction vs 8g: re-derivation from the image shows the
+  *      [02]==0 leg needs byte6==0 - unreachable under PE12=1
+  *      (min byte 0x11) - while the [02]!=0 leg needs only
+  *      byte0-lo in {0,1,5}; B0=0x51 satisfies the reachable half.)
+  *    - echo: each element is a 3-bit window of the last MAIN-driven
+  *      upload byte (low byte of the latest PEDRL write - the byte a
+  *      real DSP would ACK/echo; documented assumption): step%3==0
+  *      -> b[2:0] (identity-echo of the low bits), ==1 -> b[5:3],
+  *      ==2 -> b[7:6] (0-3). Before any PEDRL write lands, reads
+  *      stay loopback (nothing invented).
+  *    - combo: phase-1 reads serve the order nibble (merge-driving
+  *      hi from validator constants), phase-2 reads serve the echo
+  *      window (ACK-like lo). Scope bound (8j brief): at most 3
+  *      boots, verdict MOVED-or-NOTHING; no duty-cycle sweeps, no new
+  *    pins, no payloads beyond validator constants + echo transforms.
  *
  * What this does NOT do (honest limits):
  * - No DSP56371 core executes yet: the opcode census needs a complete
@@ -178,6 +215,10 @@ typedef struct {
     int reply_hi;       /* -1 = OFF (loopback); else 0-7, phase-1 PE15:13 */
     int reply_lo;       /* -1 = OFF (loopback); else 0-7, phase-2 PE15:13 */
     bool pulse_pe12;    /* Task 8h: PE12 LOW only at sampler phase reads */
+    int seq_mode;       /* Task 8j: 0=OFF, 1=order, 2=echo, 3=combo */
+    unsigned seq_pos;   /* per-strobe position (advances on sampler reads) */
+    uint8_t last_sent;  /* low byte of latest MAIN PEDRL write (echo src) */
+    bool have_sent;     /* a PEDRL byte has been snooped since reset */
 } Cdj850Dsp;
 
 static Cdj850Dsp cdj850_dsp;
@@ -222,6 +263,31 @@ void cdj850_dsp_init(void)
                     "pcs 0x0C0FC922/0x0C0FC95C, HIGH elsewhere; "
                     "PE6/PE8 READY untouched; hardware capture "
                     "replaces this)");
+    }
+    /* Experimental sequenced reply (Task 8j): $CDJ850_DSP_SEQ =
+     * order|echo|combo. Default OFF. Parsed once; invalid = OFF + warn. */
+    {
+        const char *seq = getenv("CDJ850_DSP_SEQ");
+
+        if (seq && *seq) {
+            if (strcmp(seq, "order") == 0) {
+                cdj850_dsp.seq_mode = 1;
+            } else if (strcmp(seq, "echo") == 0) {
+                cdj850_dsp.seq_mode = 2;
+            } else if (strcmp(seq, "combo") == 0) {
+                cdj850_dsp.seq_mode = 3;
+            } else {
+                info_report("cdj850: dsp seq: ignoring bad CDJ850_DSP_SEQ "
+                            "'%s' (want order|echo|combo), OFF", seq);
+                cdj850_dsp.seq_mode = 0;
+            }
+            if (cdj850_dsp.seq_mode) {
+                info_report("cdj850: dsp seq: EXPERIMENTAL sequence ON "
+                            "(CDJ850_DSP_SEQ=%s: per-strobe PE15:13 pattern, "
+                            "static REPLY overridden at sampler reads only; "
+                            "hardware capture replaces this)", seq);
+            }
+        }
     }
 }
 
@@ -272,8 +338,18 @@ void cdj850_dsp_snoop_write(hwaddr off, uint64_t val, unsigned size,
                         pc, ms);
         }
     }
-    /* Record MAIN-driven Port-E data/direction writes (both halves). */
-    if (off == CDJ850_PEDRL_OFF || off == CDJ850_PEIORL_OFF) {
+    /* Task 8j echo source: low byte of the latest MAIN PEDRL write is
+     * the most recent upload byte a real DSP would ACK/echo. Any write
+     * overlapping the PEDRL low byte refreshes it (assumption: the DSP
+     * echoes uploads; documented in the file header). */
+    if (off <= CDJ850_PEDRL_OFF + 1 &&
+        off + size > CDJ850_PEDRL_OFF + 1) {
+        unsigned shift = (CDJ850_PEDRL_OFF + 2 - off - size) * 8;
+
+        cdj850_dsp.last_sent = (uint8_t)((val >> shift) & 0xFFu);
+        cdj850_dsp.have_sent = true;
+    }
+    /* Record MAIN-driven Port-E data/direction writes (both halves). */    if (off == CDJ850_PEDRL_OFF || off == CDJ850_PEIORL_OFF) {
         Cdj850DspRec r;
 
         cdj850_dsp_open_rec();
@@ -335,22 +411,80 @@ uint64_t cdj850_dsp_adjust_read(hwaddr off, unsigned size, uint64_t v,
     }
     /* Experimental reply drive (Task 8g, default OFF): the DSP owns
      * PE15:13 DATA. The sampler's two phase reads get H/L; every other
-     * Port-E read sees the quiescent H. PE12/READY is never cleared. */
-    if (cdj850_dsp.reply_hi >= 0) {
+     * Port-E read sees the quiescent H. PE12/READY is never cleared.
+     * Task 8j: an active sequence overrides the static H/L at the
+     * sampler reads (only there); echo elements need a snooped upload
+     * byte first, else that strobe stays loopback. */
+    {
+        /* Order pattern: 10 validator-ordered bytes (B0=0x51, B1=0x11,
+         * B2-B8=0x55, B9=0x71) as PE15:13 nibbles; see header §5. */
+        static const int order_pat[20] = {
+            2, 0, 0, 0, 2, 2, 2, 2, 2, 2,
+            2, 2, 2, 2, 2, 2, 2, 2, 3, 0,
+        };
+        bool at_ph1 = (pc == CDJ850_SAMPLER_PH1_PC);
+        bool at_ph2 = (pc == CDJ850_SAMPLER_PH2_PC);
         unsigned shift;
-        int nib3;
 
-        for (i = 0; i < size; i++) {
-            if (off + i != CDJ850_PEDRL_OFF) {
-                continue;
+        if (cdj850_dsp.seq_mode && (at_ph1 || at_ph2)) {
+            unsigned pos = cdj850_dsp.seq_pos++;
+            int nib3 = -1;
+
+            if (cdj850_dsp.seq_mode == 1) {
+                nib3 = order_pat[pos % 20];
+            } else if (cdj850_dsp.seq_mode == 2) {
+                if (cdj850_dsp.have_sent) {
+                    uint8_t b = cdj850_dsp.last_sent;
+
+                    if (pos % 3 == 0) {
+                        nib3 = b & 7;
+                    } else if (pos % 3 == 1) {
+                        nib3 = (b >> 3) & 7;
+                    } else {
+                        nib3 = (b >> 6) & 3;
+                    }
+                }
+            } else {
+                if (at_ph1) {
+                    nib3 = order_pat[pos % 20];
+                } else if (cdj850_dsp.have_sent) {
+                    uint8_t b = cdj850_dsp.last_sent;
+
+                    if (pos % 3 == 0) {
+                        nib3 = b & 7;
+                    } else if (pos % 3 == 1) {
+                        nib3 = (b >> 3) & 7;
+                    } else {
+                        nib3 = (b >> 6) & 3;
+                    }
+                }
             }
-            shift = (size - 1 - i) * 8;
-            nib3 = cdj850_dsp.reply_hi;
-            if (pc == CDJ850_SAMPLER_PH2_PC) {
-                nib3 = cdj850_dsp.reply_lo;
+            if (nib3 >= 0) {
+                for (i = 0; i < size; i++) {
+                    if (off + i != CDJ850_PEDRL_OFF) {
+                        continue;
+                    }
+                    shift = (size - 1 - i) * 8;
+                    v &= ~((uint64_t)0xE0 << shift);
+                    v |= (uint64_t)((nib3 & 7) << 5) << shift;
+                }
             }
-            v &= ~((uint64_t)0xE0 << shift);
-            v |= (uint64_t)((nib3 & 7) << 5) << shift;
+        } else if (cdj850_dsp.reply_hi >= 0) {
+            unsigned shift2;
+            int nib3b;
+
+            for (i = 0; i < size; i++) {
+                if (off + i != CDJ850_PEDRL_OFF) {
+                    continue;
+                }
+                shift2 = (size - 1 - i) * 8;
+                nib3b = cdj850_dsp.reply_hi;
+                if (pc == CDJ850_SAMPLER_PH2_PC) {
+                    nib3b = cdj850_dsp.reply_lo;
+                }
+                v &= ~((uint64_t)0xE0 << shift2);
+                v |= (uint64_t)((nib3b & 7) << 5) << shift2;
+            }
         }
     }
     return v;
