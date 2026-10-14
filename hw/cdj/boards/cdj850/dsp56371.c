@@ -20,11 +20,11 @@
  *
  * What this models (Task 8c step 2):
  *
- * 1. Bootstrap READY. After MAIN releases DSPRST (PEDRL bring-up 0 → 0x40
- *    → 0x140 → 0x1C0 at ~1530 ms, bits 6/8/7 in order; DSPRST releases the
- *    AUDIO DSP with H per the service manual §10.15 level table, and the
- *    power-on sequence "the program is downloaded to IC301" follows
- *    IC103-pin158 → IC301-pin47 RESET release), the DSP is alive and
+ * 1. Bootstrap READY. After MAIN drives the servo Port-E bring-up (PEDRL 0 → 0x40
+ *    → 0x140 → 0x1C0 at ~1530 ms, bits 6/8/7 in order = PE6 spare / PE8 SRVBCLK /
+ *    PE7 SRVCCE servo enable/clock init per Task 8m §3 — NOT DSPRST, which is
+ *    RESET_B pin 47 with unlabeled origin and is not a PE pin), the servo peer
+ *    is alive and
  *    asserts its host-boot READY levels: HREQ/DSPDREQ (MAIN PE12, IC103
  *    pin 72 = PE12/RXD3 per the 10.2/10.14 schematic+waveform) plus the
  *    two gate inputs PE6 then PE8 that 0x0C0FCA7A/0x0C0FCBB0 poll with
@@ -399,7 +399,8 @@ static void cdj850_dsp_open_rec(void)
 void cdj850_dsp_snoop_write(hwaddr off, uint64_t val, unsigned size,
                             uint32_t pc, uint64_t ms)
 {
-    /* Bring-up tracker: PEDRL 0 → 0x40 → 0x140 → 0x1C0 releases DSPRST. */
+    /* Bring-up tracker: PEDRL 0 → 0x40 → 0x140 → 0x1C0 = PE6 spare/SRVBCLK/SRVCCE
+     * servo enable/clock init (Task 8m §3; NOT DSPRST, which is not a PE pin). */
     if (!cdj850_dsp.alive &&
         (off == CDJ850_PEDRL_OFF ||
          (off < CDJ850_PEDRL_OFF &&
